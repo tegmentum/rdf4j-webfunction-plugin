@@ -22,6 +22,20 @@ SELECT ?result WHERE {
 }
 ```
 
+## Performance
+
+- Shared static `Engine` built once from `WebFunctionConfig` on first `wf:call`.
+- `ConcurrentHashMap<URL, Component>` caches compiled components per URL. Repeat
+  calls to the same wasm skip download + compile; only the per-call
+  `ComponentInstance` is fresh.
+- Cost: `webfunctions.*` system properties are read once at first use — changing
+  them mid-run has no effect. Test-only `Rdf4jWasmInstance.resetCache()` drops
+  shared state for isolation.
+- Bench (Darwin aarch64, `to_upper` component, warm cache):
+  - `evaluate`: ~95 µs/op (11k ops/s) — slower than sibling bindings; likely
+    `ValueFactory.createLiteral` allocation overhead.
+  - `instantiate`: ~1.5 ms/op
+
 ## Config (system properties)
 
 - `webfunctions.engine.provider` (default `wasmtime`)
