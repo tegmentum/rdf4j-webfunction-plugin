@@ -4,11 +4,42 @@ Eclipse RDF4J binding for the WebAssembly Component Model. Registers a SPARQL
 filter function under `http://tegmentum.ai/ns/webfunction/` that loads a WASM
 component from a URL and invokes its `evaluate` export.
 
+Part of a three-binding family that all share one component ABI:
+
+| Binding | Repo |
+|---|---|
+| Stardog | [tegmentum/stardog-webfunction-plugin](https://github.com/tegmentum/stardog-webfunction-plugin) |
+| Apache Jena | [tegmentum/jena-webfunction-plugin](https://github.com/tegmentum/jena-webfunction-plugin) |
+| Eclipse RDF4J | you are here |
+
+The WIT world at `src/main/wit/webfunction.wit` (package `stardog:webfunction@0.2.0`)
+is byte-for-byte identical across the three repos, so a single Rust component
+runs unmodified under any of the three SPARQL engines. WASM runtime is
+[webassembly4j](https://github.com/tegmentum/webassembly4j) (wasmtime provider).
+
 Component runtime: [webassembly4j](https://github.com/tegmentum/webassembly4j)
 (wasmtime provider). Component ABI shared with the Stardog and Jena bindings —
 the WIT world at `src/main/wit/webfunction.wit` is package
 `stardog:webfunction@0.2.0` (kept as a cross-framework namespace so the same
 `.wasm` component can be invoked from any of the three).
+
+## SPARQL surfaces
+
+The wf:call function is exposed through four SPARQL surfaces; all back onto
+the same component's `evaluate` / `aggregate-step` / `aggregate-finish`
+exports.
+
+| Shape | Syntax | When to reach for it |
+|---|---|---|
+| Filter | `BIND(wf:call(<url>, args...) AS ?x)` | one value out of one wasm call |
+| Aggregate | `SELECT (<wf:call-agg>(<url>, ?v) AS ?sum)` | reduce query rows to one value |
+| Tuple | via `TupleFunctionEvaluationStrategy` | multi-row output (see `TestWfCallTupleFunction`) |
+| SERVICE | `SERVICE <url> { BIND(...) }` | multi-row, multi-var output |
+
+The tuple form is RDF4J's analog of Jena's property function; RDF4J's default
+`StrictEvaluationStrategy` doesn't dispatch to TupleFunctions, so consumers
+must configure `TupleFunctionEvaluationStrategy` on the sail (plus SPINX-style
+parser support or programmatic query-algebra construction to write the SPARQL).
 
 ## Usage
 
