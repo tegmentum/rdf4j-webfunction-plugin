@@ -15,29 +15,65 @@ import org.eclipse.rdf4j.model.ValueFactory;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.net.URL;
 import java.net.URLConnection;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Component-model WASM instance for the RDF4J binding.
+ * Component-model WASM instance for the RDF4J binding. Uses a process-wide
+ * shared {@link Engine} + per-URL cached {@link Component}; each instance
+ * owns a fresh {@link ComponentInstance}. See the Jena binding's analog for
+ * the config-freeze caveat.
  */
 public final class Rdf4jWasmInstance implements Closeable {
 
-    private Engine engine;
-    private Component component;
+    private static volatile Engine SHARED_ENGINE;
+    private static final Object ENGINE_LOCK = new Object();
+    private static final ConcurrentHashMap<URL, Component> COMPONENT_CACHE =
+            new ConcurrentHashMap<>();
+
     private ComponentInstance instance;
     private boolean closed;
 
     public Rdf4jWasmInstance(final URL wasmUrl) throws IOException {
-        this.engine = WebFunctionConfig.buildEngine();
-        if (!engine.capabilities().supportsComponents()) {
-            engine.close();
-            throw new IllegalStateException("engine '"
-                    + engine.info().engineId() + "' does not support components");
-        }
-        this.component = engine.loadComponent(readAll(wasmUrl));
+        final Component component = componentFor(wasmUrl);
         this.instance = component.instantiate(DefaultLinkingContext.builder().build());
+    }
+
+    private static Engine sharedEngine() {
+        Engine e = SHARED_ENGINE;
+        if (e != null) return e;
+        synchronized (ENGINE_LOCK) {
+            if (SHARED_ENGINE == null) {
+                final Engine built = WebFunctionConfig.buildEngine();
+                if (!built.capabilities().supportsComponents()) {
+                    built.close();
+                    throw new IllegalStateException("engine '"
+                            + built.info().engineId() + "' does not support components");
+                }
+                SHARED_ENGINE = built;
+            }
+            return SHARED_ENGINE;
+        }
+    }
+
+    private static Component componentFor(final URL wasmUrl) throws IOException {
+        Component cached = COMPONENT_CACHE.get(wasmUrl);
+        if (cached != null) return cached;
+        final Engine engine = sharedEngine();
+        try {
+            return COMPONENT_CACHE.computeIfAbsent(wasmUrl, u -> {
+                try {
+                    return engine.loadComponent(readAll(u));
+                } catch (IOException ioe) {
+                    throw new UncheckedIOException(ioe);
+                }
+            });
+        } catch (UncheckedIOException e) {
+            throw e.getCause();
+        }
     }
 
     public List<WitValueMarshaller.Row> evaluate(final ValueFactory vf, final Value... args) throws IOException {
@@ -95,11 +131,19 @@ public final class Rdf4jWasmInstance implements Closeable {
 
     @Override
     public void close() {
-        if (component != null) component.close();
-        if (engine != null) engine.close();
         instance = null;
-        component = null;
-        engine = null;
         closed = true;
+    }
+
+    /** Purge cached components + close shared engine. Test-only. */
+    static void resetCache() {
+        COMPONENT_CACHE.forEach((k, c) -> c.close());
+        COMPONENT_CACHE.clear();
+        synchronized (ENGINE_LOCK) {
+            if (SHARED_ENGINE != null) {
+                SHARED_ENGINE.close();
+                SHARED_ENGINE = null;
+            }
+        }
     }
 }
