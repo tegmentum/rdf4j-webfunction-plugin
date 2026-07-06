@@ -33,13 +33,21 @@ exports.
 |---|---|---|
 | Filter | `BIND(wf:call(<url>, args...) AS ?x)` | one value out of one wasm call |
 | Aggregate | `SELECT (<wf:call-agg>(<url>, ?v) AS ?sum)` | reduce query rows to one value |
-| Tuple | via `TupleFunctionEvaluationStrategy` | multi-row output (see `TestWfCallTupleFunction`) |
+| Tuple | `(arg1 arg2 …) wf:call (?out1 ?out2 …)` | multi-row, multi-var output |
 | SERVICE | `SERVICE <url> { BIND(...) }` | multi-row, multi-var output |
 
-The tuple form is RDF4J's analog of Jena's property function; RDF4J's default
+The tuple form is RDF4J's analog of Jena's property function. RDF4J's default
 `StrictEvaluationStrategy` doesn't dispatch to TupleFunctions, so consumers
-must configure `TupleFunctionEvaluationStrategy` on the sail (plus SPINX-style
-parser support or programmatic query-algebra construction to write the SPARQL).
+must wire the sail with `WfEvaluationStrategyFactory` (returns a
+`TupleFunctionEvaluationStrategy` and prepends `WfCallTupleFunctionOptimizer`
+to the query pipeline so the SPIN-style magic-property syntax above works
+from plain SPARQL text):
+
+```java
+MemoryStore store = new MemoryStore();
+store.setEvaluationStrategyFactory(new WfEvaluationStrategyFactory(null));
+SailRepository repo = new SailRepository(store);
+```
 
 ## Usage
 

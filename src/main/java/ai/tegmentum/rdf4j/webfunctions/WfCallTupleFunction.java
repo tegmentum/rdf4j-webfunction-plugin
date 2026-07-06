@@ -26,12 +26,15 @@ import java.util.List;
  * <p>Registered on the classpath via
  * {@code META-INF/services/org.eclipse.rdf4j.query.algebra.evaluation.function.TupleFunction}.
  *
- * <p>Caveats: RDF4J's default {@code StrictEvaluationStrategy} does not
- * dispatch to TupleFunctions. Consumers must use {@code
- * TupleFunctionEvaluationStrategy} (or a strategy factory that returns it)
- * for the SPARQL-facing wiring, and either use SPARQL syntax extensions
- * (SPINX) or construct the query algebra directly. See {@code
- * TestWfCallTupleFunction} for how the test drives it programmatically.
+ * <p>SPARQL-textual invocation works out of the box when the Sail is wired
+ * with {@link WfEvaluationStrategyFactory}: that factory returns a {@link
+ * org.eclipse.rdf4j.query.algebra.evaluation.impl.TupleFunctionEvaluationStrategy}
+ * (RDF4J's default {@code StrictEvaluationStrategy} does not dispatch to
+ * TupleFunctions) and prepends {@link WfCallTupleFunctionOptimizer} to the
+ * query pipeline so the SPIN-style magic-property syntax
+ * {@code (arg1 arg2) wf:call (?out1 ?out2)} is recognised. See {@code
+ * TestWfCallTupleFunctionSparql} for the end-to-end path and {@code
+ * TestWfCallTupleFunction} for the underlying programmatic bridge.
  */
 public final class WfCallTupleFunction implements TupleFunction {
 
