@@ -32,9 +32,13 @@ SELECT ?result WHERE {
   them mid-run has no effect. Test-only `Rdf4jWasmInstance.resetCache()` drops
   shared state for isolation.
 - Bench (Darwin aarch64, `to_upper` component, warm cache):
-  - `evaluate`: ~95 µs/op (11k ops/s) — slower than sibling bindings; likely
-    `ValueFactory.createLiteral` allocation overhead.
-  - `instantiate`: ~1.5 ms/op
+  - `evaluate`: ~17 µs/op (59k ops/s)
+  - `instantiate`: ~268 µs/op
+- Datatype IRIs are interned in a static `ConcurrentHashMap` because
+  RDF4J's `SimpleValueFactory.createIRI` allocates a fresh `SimpleIRI` per
+  call (Jena's `TypeMapper` interns equivalent datatypes for free).
+  Without this cache, per-literal `createIRI` was ~half of the evaluate hot
+  path's allocations — the fix drops evaluate from ~95 µs/op to ~17 µs/op.
 
 ## Config (system properties)
 

@@ -21,6 +21,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Marshalling between RDF4J {@link Value} and the WIT value model declared in
@@ -142,6 +143,12 @@ public final class WitValueMarshaller {
         return new IllegalArgumentException("value variant '" + kase + "' is missing payload");
     }
 
+    // Cache datatype IRIs so repeated literal round-trips don't allocate a
+    // fresh SimpleIRI per call. RDF4J's SimpleValueFactory.createIRI has no
+    // built-in interning (Jena's TypeMapper caches equivalent Node datatypes),
+    // and profiling showed this was ~half of the evaluate-hot-path allocations.
+    private static final ConcurrentHashMap<String, IRI> DATATYPE_CACHE = new ConcurrentHashMap<>();
+
     private static Literal literalFromWit(final WitRecord record, final ValueFactory vf) {
         final String label = ((WitString) record.getField("label")).getValue();
         final String datatype = ((WitString) record.getField("datatype")).getValue();
@@ -149,7 +156,8 @@ public final class WitValueMarshaller {
         if (lang.isPresent()) {
             return vf.createLiteral(label, (String) lang.get());
         }
-        return vf.createLiteral(label, vf.createIRI(datatype));
+        final IRI dt = DATATYPE_CACHE.computeIfAbsent(datatype, vf::createIRI);
+        return vf.createLiteral(label, dt);
     }
 
     /**
