@@ -9,6 +9,7 @@ import org.eclipse.rdf4j.query.algebra.evaluation.federation.FederatedServiceRes
 import org.eclipse.rdf4j.query.algebra.evaluation.impl.AbstractEvaluationStrategyFactory;
 import org.eclipse.rdf4j.query.algebra.evaluation.impl.DefaultEvaluationStrategy;
 import org.eclipse.rdf4j.query.algebra.evaluation.impl.EvaluationStatistics;
+import org.eclipse.rdf4j.query.algebra.evaluation.impl.TupleFunctionEvaluationStatistics;
 import org.eclipse.rdf4j.query.algebra.evaluation.impl.TupleFunctionEvaluationStrategy;
 import org.eclipse.rdf4j.query.algebra.evaluation.optimizer.StandardQueryOptimizerPipeline;
 
@@ -40,8 +41,13 @@ public final class WfEvaluationStrategyFactory extends AbstractEvaluationStrateg
     public EvaluationStrategy createEvaluationStrategy(final Dataset dataset,
                                                        final TripleSource tripleSource,
                                                        final EvaluationStatistics statistics) {
+        // Ignore the passed-in statistics: it's whatever the sail wired up,
+        // and its CardinalityCalculator throws on TupleFunctionCall nodes that
+        // WfCallTupleFunctionOptimizer introduces. TupleFunctionEvaluationStatistics
+        // knows how to size them; substitute unconditionally.
+        final EvaluationStatistics tfStats = new TupleFunctionEvaluationStatistics();
         final TupleFunctionEvaluationStrategy strategy = new TupleFunctionEvaluationStrategy(
-                tripleSource, dataset, serviceResolver, getQuerySolutionCacheThreshold(), statistics);
+                tripleSource, dataset, serviceResolver, getQuerySolutionCacheThreshold(), tfStats);
 
         // AbstractEvaluationStrategyFactory#getOptimizerPipeline returns
         // whatever caller-supplied pipeline was set on this factory (Optional).
@@ -49,7 +55,7 @@ public final class WfEvaluationStrategyFactory extends AbstractEvaluationStrateg
         // tuple-function optimizer in front of the standard optimizers.
         final QueryOptimizerPipeline pipeline = getOptimizerPipeline()
                 .orElseGet(() -> withTupleFunctionOptimizer(
-                        new StandardQueryOptimizerPipeline(strategy, tripleSource, statistics)));
+                        new StandardQueryOptimizerPipeline(strategy, tripleSource, tfStats)));
         ((DefaultEvaluationStrategy) strategy).setOptimizerPipeline(pipeline);
         return strategy;
     }
