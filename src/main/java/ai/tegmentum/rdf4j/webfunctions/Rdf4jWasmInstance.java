@@ -39,7 +39,20 @@ public final class Rdf4jWasmInstance implements Closeable {
 
     public Rdf4jWasmInstance(final URL wasmUrl) throws IOException {
         final Component component = componentFor(wasmUrl);
-        this.instance = component.instantiate(DefaultLinkingContext.builder().build());
+        final DefaultLinkingContext.Builder linker = DefaultLinkingContext.builder();
+        // v0.3.0 host callbacks: only bound if enabled by config. Older
+        // components (v0.2.0 WIT world) declare no such imports and see the
+        // linker's set of registered wit-host-functions ignored — the wasm
+        // engine only pulls what the component's imports section names.
+        if (WebFunctionConfig.callbackEnabled()) {
+            linker.addWitHostFunction(
+                "stardog:webfunction/host@0.3.0#execute-query",
+                HostCallbacks.executeQuery());
+            linker.addWitHostFunction(
+                "stardog:webfunction/host@0.3.0#callback-depth",
+                HostCallbacks.callbackDepth());
+        }
+        this.instance = component.instantiate(linker.build());
     }
 
     private static Engine sharedEngine() {
