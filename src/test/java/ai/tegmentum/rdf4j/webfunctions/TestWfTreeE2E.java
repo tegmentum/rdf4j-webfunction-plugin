@@ -8,7 +8,6 @@ import org.eclipse.rdf4j.query.TupleQueryResult;
 import org.eclipse.rdf4j.repository.RepositoryConnection;
 import org.eclipse.rdf4j.repository.sail.SailRepository;
 import org.eclipse.rdf4j.sail.memory.MemoryStore;
-import org.junit.Ignore;
 import org.junit.Test;
 
 import java.io.File;
@@ -41,46 +40,6 @@ public class TestWfTreeE2E {
             System.getProperty("user.home")
                     + "/git/tegmentum-webfunctions/target/wasm32-wasip1/release/wf_tree.wasm");
 
-    /**
-     * Still ignored, though further along than the previous scaffold:
-     * HostCallbacks now marshals its returns as WitResult/WitRecord/WitList/
-     * WitString via the same idiom {@link WitValueMarshaller} uses for
-     * VALUE_TYPE. Component instantiation now succeeds — before, we failed
-     * at instantiate with "instance export execute-query has the wrong
-     * type: function implementation is missing." Now, invocation crashes
-     * inside wf_tree::walk at the callback-boundary trap:
-     *
-     *   "Function call failed: error while executing at wasm backtrace:
-     *      0: wf_tree.wasm!wf_tree::walk
-     *      1: wf_tree.wasm!evaluate"
-     *
-     * The callback body never runs — the trap happens as wasm invokes the
-     * import. That's a signature-level mismatch between what wit-bindgen's
-     * generated ABI for `execute-query` expects and what wasmtime4j's
-     * WitHostFunction registration exposes.
-     *
-     * Debugging path from here (needs a scratch component + dedicated
-     * session):
-     *   1. Build a minimal wasm component that just calls callback-depth()
-     *      (u32 return, no arg complexity). If that works, execute-query's
-     *      compound argument shapes are the culprit; if it doesn't, the
-     *      binding wire-up itself is wrong.
-     *   2. If callback-depth also traps, check that
-     *      DefaultLinkingContext.addWitHostFunction genuinely produces a
-     *      compatible function definition — may need to look at
-     *      WitHostFunctionDefinition's other constructor (which accepts
-     *      an explicit type signature) rather than the two-arg form.
-     *   3. If callback-depth works, iterate execute-query: encode empty
-     *      result first (just varsSet=[] rows=[]), then add one binding,
-     *      etc. Look at the wasm memory dump on trap to spot the shape
-     *      mismatch.
-     *
-     * Everything else in the plumbing is real progress and unblocks the
-     * debugging: strategy binding solves connection threading, the
-     * v0.3.0 WIT world is committed and the wasm component uses it,
-     * WitResult / WitRecord / WitList encoding is in place.
-     */
-    @Ignore("wasmtime4j WitHostFunction signature mismatch — see comment above")
     @Test
     public void tinyTreeFromRoot() throws Exception {
         final File wasm = new File(WF_TREE_WASM);
