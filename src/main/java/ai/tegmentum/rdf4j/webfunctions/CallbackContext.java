@@ -37,18 +37,41 @@ public final class CallbackContext {
 
     private final EvaluationStrategy strategy;
     private final TripleSource tripleSource;
+    private final org.eclipse.rdf4j.sail.Sail sail;
     private final int maxDepth;
     private final int maxRows;
     private int depth = 0;
 
+    // Prepared-query handles, minted by prepare() and used by runPrepared().
+    // Cleared implicitly when this context is dropped (per top-level query).
+    private final java.util.Map<Integer, Prepared> prepared = new java.util.HashMap<>();
+    private int nextHandle = 1;
+
+    /**
+     * A precompiled sub-query bound to this context's strategy. Holds the
+     * {@link QueryEvaluationStep} so runPrepared() only pays initial-binding
+     * substitution + iteration on each call.
+     */
+    private static final class Prepared {
+        final QueryEvaluationStep step;
+        Prepared(final QueryEvaluationStep step) { this.step = step; }
+    }
+
     private CallbackContext(final EvaluationStrategy strategy,
                             final TripleSource tripleSource,
+                            final org.eclipse.rdf4j.sail.Sail sail,
                             final int maxDepth,
                             final int maxRows) {
         this.strategy = strategy;
         this.tripleSource = tripleSource;
+        this.sail = sail;
         this.maxDepth = maxDepth;
         this.maxRows = maxRows;
+    }
+
+    /** Legacy bind — no sail; execute-update unavailable. */
+    public static void bind(final EvaluationStrategy strategy, final TripleSource tripleSource) {
+        bind(strategy, tripleSource, null);
     }
 
     /**
@@ -56,11 +79,19 @@ public final class CallbackContext {
      * {@link WfEvaluationStrategyFactory} when the strategy is built. If a
      * context is already bound (nested strategy), don't clobber it — the
      * outer strategy's context stays authoritative.
+     *
+     * <p>{@code sail} enables the v0.3.1 execute-update import; may be null.
      */
-    public static void bind(final EvaluationStrategy strategy, final TripleSource tripleSource) {
-        if (CURRENT.get() != null) return;
+    public static void bind(final EvaluationStrategy strategy,
+                            final TripleSource tripleSource,
+                            final org.eclipse.rdf4j.sail.Sail sail) {
+        // Always replace at strategy construction. RDF4J constructs a fresh
+        // strategy per top-level query, so an earlier query's context is
+        // stale. Nested wf callbacks (execute-query re-entering wasm)
+        // reuse the CURRENT context via precompile on the SAME strategy —
+        // that path doesn't call bind(), so the depth counter is preserved.
         CURRENT.set(new CallbackContext(
-                strategy, tripleSource,
+                strategy, tripleSource, sail,
                 WebFunctionConfig.callbackMaxDepth(),
                 WebFunctionConfig.callbackMaxRows()));
     }
@@ -135,6 +166,118 @@ public final class CallbackContext {
             return step.evaluate(initialBindings);
         } catch (MalformedQueryException e) {
             throw new RuntimeException("wf callback: SPARQL parse error: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * v0.3.2 prepare-query — parse and precompile a SPARQL SELECT once so
+     * subsequent runPrepared() calls only pay initial-binding substitution
+     * and iteration. Returns a small integer handle usable until this
+     * context ends.
+     */
+    public int prepare(final String sparql) {
+        try {
+            final ParsedTupleQuery parsed = QueryParserUtil.parseTupleQuery(
+                    QueryLanguage.SPARQL, sparql, null);
+            final QueryEvaluationStep step = strategy.precompile(
+                    parsed.getTupleExpr(),
+                    new QueryEvaluationContext.Minimal(parsed.getDataset()));
+            final int h = nextHandle++;
+            prepared.put(h, new Prepared(step));
+            return h;
+        } catch (MalformedQueryException e) {
+            throw new RuntimeException("wf callback: SPARQL parse error: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * v0.3.3 follow-predicate — direct triple pattern lookup. Returns
+     * the objects of triples matching {@code (subject, predicate, ?)} via
+     * {@link TripleSource#getStatements}. No SPARQL parsing or algebra
+     * evaluation; just an index scan.
+     */
+    public java.util.List<org.eclipse.rdf4j.model.Value> followPredicate(
+            final org.eclipse.rdf4j.model.Value subject,
+            final org.eclipse.rdf4j.model.Value predicate) {
+        if (!(subject instanceof org.eclipse.rdf4j.model.Resource)) {
+            throw new RuntimeException(
+                "wf callback: follow-predicate subject must be IRI or bnode");
+        }
+        if (!(predicate instanceof org.eclipse.rdf4j.model.IRI)) {
+            throw new RuntimeException(
+                "wf callback: follow-predicate predicate must be IRI");
+        }
+        final java.util.List<org.eclipse.rdf4j.model.Value> out = new java.util.ArrayList<>();
+        try (CloseableIteration<? extends org.eclipse.rdf4j.model.Statement> it =
+                tripleSource.getStatements(
+                        (org.eclipse.rdf4j.model.Resource) subject,
+                        (org.eclipse.rdf4j.model.IRI) predicate,
+                        null)) {
+            while (it.hasNext()) {
+                out.add(it.next().getObject());
+            }
+        }
+        return out;
+    }
+
+    /** v0.3.2 run-prepared — evaluate a handle from {@link #prepare} with
+     *  fresh initial bindings. */
+    public CloseableIteration<BindingSet> runPrepared(final int handle,
+                                                     final BindingSet initialBindings) {
+        final Prepared p = prepared.get(handle);
+        if (p == null) {
+            throw new RuntimeException("wf callback: unknown prepared handle " + handle);
+        }
+        return p.step.evaluate(initialBindings);
+    }
+
+    /**
+     * v0.3.1 execute-update — SPARQL 1.1 UPDATE against the outer
+     * {@link org.eclipse.rdf4j.sail.Sail}. Opens a fresh
+     * {@link org.eclipse.rdf4j.sail.SailConnection} for the update; that
+     * connection is a SEPARATE transaction from the outer read query, so
+     * concurrent isolation depends on the underlying store's semantics
+     * (MemoryStore uses snapshot isolation, so the read view won't see the
+     * write until the read closes).
+     *
+     * <p>When the factory was constructed without a Sail (the pre-existing
+     * one-arg constructor), throws {@link IllegalStateException} — the
+     * caller returns err to the guest.
+     */
+    public void executeUpdate(final String sparql,
+                              final org.eclipse.rdf4j.query.BindingSet initial) {
+        if (sail == null) {
+            throw new IllegalStateException(
+                "wf callback: RDF4J execute-update needs a Sail — construct "
+                + "WfEvaluationStrategyFactory with the two-arg overload");
+        }
+        try (org.eclipse.rdf4j.sail.SailConnection sc = sail.getConnection()) {
+            sc.begin();
+            try {
+                final org.eclipse.rdf4j.query.parser.ParsedUpdate parsed =
+                        org.eclipse.rdf4j.query.parser.QueryParserUtil.parseUpdate(
+                                QueryLanguage.SPARQL, sparql, null);
+                final org.eclipse.rdf4j.repository.sail.helpers.SailUpdateExecutor exec =
+                        new org.eclipse.rdf4j.repository.sail.helpers.SailUpdateExecutor(
+                                sc, tripleSource.getValueFactory(),
+                                new org.eclipse.rdf4j.rio.ParserConfig());
+                for (org.eclipse.rdf4j.query.algebra.UpdateExpr expr : parsed.getUpdateExprs()) {
+                    exec.executeUpdate(expr,
+                            parsed.getDatasetMapping().get(expr),
+                            initial,
+                            true,   // includeInferred
+                            -1);    // maxExecutionTime
+                }
+                sc.commit();
+            } catch (RuntimeException | Error re) {
+                sc.rollback();
+                throw re;
+            } catch (Exception e) {
+                sc.rollback();
+                throw new RuntimeException("wf callback: update failed: " + e.getMessage(), e);
+            }
+        } catch (MalformedQueryException e) {
+            throw new RuntimeException("wf callback: SPARQL update parse error: " + e.getMessage(), e);
         }
     }
 }

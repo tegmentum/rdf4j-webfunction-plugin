@@ -32,9 +32,23 @@ import java.util.List;
 public final class WfEvaluationStrategyFactory extends AbstractEvaluationStrategyFactory {
 
     private final FederatedServiceResolver serviceResolver;
+    private final org.eclipse.rdf4j.sail.Sail sail;
 
     public WfEvaluationStrategyFactory(final FederatedServiceResolver serviceResolver) {
+        this(serviceResolver, null);
+    }
+
+    /**
+     * Overload for v0.3.1 {@code execute-update}: pass the {@link Sail} the
+     * factory is attached to and callback contexts can open write
+     * connections against it. When {@code sail} is null (the pre-existing
+     * constructor), {@code execute-update} imports return an err with a
+     * diagnostic.
+     */
+    public WfEvaluationStrategyFactory(final FederatedServiceResolver serviceResolver,
+                                       final org.eclipse.rdf4j.sail.Sail sail) {
         this.serviceResolver = serviceResolver;
+        this.sail = sail;
     }
 
     @Override
@@ -71,7 +85,7 @@ public final class WfEvaluationStrategyFactory extends AbstractEvaluationStrateg
         // NEXT query when the current one has closed. For strict cleanup,
         // callers can invoke CallbackContext.unbind() between queries.
         if (WebFunctionConfig.callbackEnabled()) {
-            CallbackContext.bind(strategy, tripleSource);
+            CallbackContext.bind(strategy, tripleSource, sail);
         }
         return strategy;
     }

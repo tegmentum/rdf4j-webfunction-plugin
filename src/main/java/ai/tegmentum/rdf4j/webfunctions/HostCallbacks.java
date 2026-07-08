@@ -83,6 +83,126 @@ public final class HostCallbacks {
         };
     }
 
+    /** {@code follow-predicate: func(subject: value, predicate: value)
+     *  -> result<list<value>, string>}  (v0.3.3). */
+    public static WitHostFunction followPredicate() {
+        return args -> {
+            if (!WebFunctionConfig.callbackEnabled()) {
+                return new Object[] { ComponentVal.err(ComponentVal.string(
+                    "wf callback disabled by webfunctions.callback.enabled=false")) };
+            }
+            final CallbackContext ctx = CallbackContext.current();
+            if (ctx == null) {
+                return new Object[] { ComponentVal.err(ComponentVal.string(
+                    "wf callback: no strategy bound")) };
+            }
+            try {
+                final org.eclipse.rdf4j.model.Value subj = decodeValue(
+                    (ComponentVal) args[0], ctx.valueFactory());
+                final org.eclipse.rdf4j.model.Value pred = decodeValue(
+                    (ComponentVal) args[1], ctx.valueFactory());
+                ctx.enter();
+                try {
+                    final java.util.List<org.eclipse.rdf4j.model.Value> objs =
+                        ctx.followPredicate(subj, pred);
+                    final java.util.List<ComponentVal> encoded =
+                        new java.util.ArrayList<>(objs.size());
+                    for (org.eclipse.rdf4j.model.Value v : objs) encoded.add(encodeValue(v));
+                    return new Object[] { ComponentVal.ok(ComponentVal.list(encoded)) };
+                } finally {
+                    ctx.exit();
+                }
+            } catch (RuntimeException e) {
+                return new Object[] { ComponentVal.err(ComponentVal.string(
+                    e.getMessage() == null ? e.toString() : e.getMessage())) };
+            }
+        };
+    }
+
+    /** {@code prepare-query: func(sparql: string) -> result<u32, string>}
+     *  (v0.3.2). */
+    public static WitHostFunction prepareQuery() {
+        return args -> {
+            if (!WebFunctionConfig.callbackEnabled()) {
+                return new Object[] { ComponentVal.err(ComponentVal.string(
+                    "wf callback disabled by webfunctions.callback.enabled=false")) };
+            }
+            final CallbackContext ctx = CallbackContext.current();
+            if (ctx == null) {
+                return new Object[] { ComponentVal.err(ComponentVal.string(
+                    "wf callback: no strategy bound")) };
+            }
+            try {
+                final String sparql = ((ComponentVal) args[0]).asString();
+                return new Object[] { ComponentVal.ok(ComponentVal.u32((long) ctx.prepare(sparql))) };
+            } catch (RuntimeException e) {
+                return new Object[] { ComponentVal.err(ComponentVal.string(
+                    e.getMessage() == null ? e.toString() : e.getMessage())) };
+            }
+        };
+    }
+
+    /** {@code run-prepared: func(handle: u32, bindings: list<binding>,
+     *  max-rows: option<u32>) -> result<binding-sets, string>}  (v0.3.2). */
+    public static WitHostFunction runPrepared() {
+        return args -> {
+            if (!WebFunctionConfig.callbackEnabled()) {
+                return new Object[] { ComponentVal.err(ComponentVal.string(
+                    "wf callback disabled by webfunctions.callback.enabled=false")) };
+            }
+            final CallbackContext ctx = CallbackContext.current();
+            if (ctx == null) {
+                return new Object[] { ComponentVal.err(ComponentVal.string(
+                    "wf callback: no strategy bound")) };
+            }
+            try {
+                final int handle = (int) ((ComponentVal) args[0]).asU32();
+                final BindingSet initial = decodeBindings((ComponentVal) args[1], ctx);
+                final int rowCap = decodeOptionalU32((ComponentVal) args[2]).orElseGet(ctx::maxRows);
+
+                ctx.enter();
+                try (CloseableIteration<BindingSet> iter = ctx.runPrepared(handle, initial)) {
+                    return new Object[] { ComponentVal.ok(encodeBindingSets(iter, rowCap)) };
+                } finally {
+                    ctx.exit();
+                }
+            } catch (RuntimeException e) {
+                return new Object[] { ComponentVal.err(ComponentVal.string(
+                    e.getMessage() == null ? e.toString() : e.getMessage())) };
+            }
+        };
+    }
+
+    /** {@code execute-update: func(sparql: string, bindings: list<binding>)
+     *  -> result<_, string>}  (v0.3.1). */
+    public static WitHostFunction executeUpdate() {
+        return args -> {
+            if (!WebFunctionConfig.callbackEnabled()) {
+                return new Object[] { ComponentVal.err(ComponentVal.string(
+                    "wf callback disabled by webfunctions.callback.enabled=false")) };
+            }
+            final CallbackContext ctx = CallbackContext.current();
+            if (ctx == null) {
+                return new Object[] { ComponentVal.err(ComponentVal.string(
+                    "wf callback: no context bound")) };
+            }
+            try {
+                final String sparql = ((ComponentVal) args[0]).asString();
+                final BindingSet initial = decodeBindings((ComponentVal) args[1], ctx);
+                ctx.enter();
+                try {
+                    ctx.executeUpdate(sparql, initial);
+                    return new Object[] { ComponentVal.ok(null) };
+                } finally {
+                    ctx.exit();
+                }
+            } catch (RuntimeException e) {
+                return new Object[] { ComponentVal.err(ComponentVal.string(
+                    e.getMessage() == null ? e.toString() : e.getMessage())) };
+            }
+        };
+    }
+
     // ---- marshalling -------------------------------------------------------
 
     /**
