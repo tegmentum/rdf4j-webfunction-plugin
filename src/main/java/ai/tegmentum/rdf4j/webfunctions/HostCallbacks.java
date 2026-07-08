@@ -2,9 +2,9 @@ package ai.tegmentum.rdf4j.webfunctions;
 
 import ai.tegmentum.webassembly4j.api.WitHostFunction;
 
+import org.eclipse.rdf4j.common.iteration.CloseableIteration;
 import org.eclipse.rdf4j.model.Value;
 import org.eclipse.rdf4j.query.BindingSet;
-import org.eclipse.rdf4j.query.TupleQueryResult;
 import org.eclipse.rdf4j.query.impl.MapBindingSet;
 
 import java.util.ArrayList;
@@ -48,16 +48,20 @@ public final class HostCallbacks {
             if (!WebFunctionConfig.callbackEnabled()) {
                 return errorResult("wf callback disabled by webfunctions.callback.enabled=false");
             }
+            final CallbackContext ctx = CallbackContext.current();
+            if (ctx == null) {
+                return errorResult(
+                    "wf callback: no strategy bound — install WfEvaluationStrategyFactory "
+                    + "on the sail to enable callbacks");
+            }
             try {
                 final String sparql = (String) args[0];
-                final BindingSet initial = decodeBindings(args[1]);
-                final int rowCap = decodeOptionalU32(args[2])
-                        .orElseGet(CallbackContext.current()::maxRows);
+                final BindingSet initial = decodeBindings(args[1], ctx);
+                final int rowCap = decodeOptionalU32(args[2]).orElseGet(ctx::maxRows);
 
-                final CallbackContext ctx = CallbackContext.current();
                 ctx.enter();
-                try (TupleQueryResult result = ctx.executeSelect(sparql, initial)) {
-                    return successResult(encodeResult(result, rowCap));
+                try (CloseableIteration<BindingSet> iter = ctx.executeSelect(sparql, initial)) {
+                    return successResult(encodeResult(iter, rowCap));
                 } finally {
                     ctx.exit();
                 }
@@ -69,7 +73,10 @@ public final class HostCallbacks {
 
     /** {@code callback-depth: func() -> u32}. */
     public static WitHostFunction callbackDepth() {
-        return args -> new Object[] { CallbackContext.current().depth() };
+        return args -> {
+            final CallbackContext ctx = CallbackContext.current();
+            return new Object[] { ctx == null ? 0 : ctx.depth() };
+        };
     }
 
     // ---- marshalling helpers -------------------------------------------------
@@ -86,7 +93,7 @@ public final class HostCallbacks {
      * per {@code WitValueMarshaller.VALUE_TYPE}).
      */
     @SuppressWarnings("unchecked")
-    private static BindingSet decodeBindings(final Object raw) {
+    private static BindingSet decodeBindings(final Object raw, final CallbackContext ctx) {
         final MapBindingSet bs = new MapBindingSet();
         if (raw == null) return bs;
         final List<Object[]> entries = (List<Object[]>) raw;
@@ -94,7 +101,7 @@ public final class HostCallbacks {
             final String name = (String) entry[0];
             final Value rdfValue = WitValueMarshaller.valueFromWit(
                     (ai.tegmentum.wasmtime4j.wit.WitValue) entry[1],
-                    CallbackContext.current().valueFactory());
+                    ctx.valueFactory());
             bs.addBinding(name, rdfValue);
         }
         return bs;
@@ -108,27 +115,29 @@ public final class HostCallbacks {
     }
 
     /**
-     * Encode a {@link TupleQueryResult} as a WIT {@code binding-sets} record
-     * (Object[]): slot 0 = vars (list of strings), slot 1 = rows
-     * (list-of-list-of-Object[] bindings).
+     * Encode a lazy {@link CloseableIteration} of {@link BindingSet}s as a
+     * WIT {@code binding-sets} record (Object[]): slot 0 = vars (list of
+     * strings), slot 1 = rows (list-of-list-of-Object[] bindings).
+     * Materialises up to {@code rowCap} rows, then drops the rest.
      */
-    private static Object[] encodeResult(final TupleQueryResult result, final int rowCap) {
-        final List<String> vars = result.getBindingNames();
+    private static Object[] encodeResult(final CloseableIteration<BindingSet> iter, final int rowCap) {
+        final java.util.LinkedHashSet<String> varsSeen = new java.util.LinkedHashSet<>();
         final List<Object> rows = new ArrayList<>();
         int rowsSeen = 0;
-        while (result.hasNext() && rowsSeen < rowCap) {
-            final BindingSet row = result.next();
+        while (iter.hasNext() && rowsSeen < rowCap) {
+            final BindingSet row = iter.next();
+            varsSeen.addAll(row.getBindingNames());
             final List<Object[]> encoded = new ArrayList<>();
-            for (String var : vars) {
-                if (!row.hasBinding(var)) continue;
+            for (String var : row.getBindingNames()) {
                 final Value rdfValue = row.getValue(var);
+                if (rdfValue == null) continue;
                 final Object witValue = WitValueMarshaller.toWit(rdfValue);
                 encoded.add(new Object[] { var, witValue });
             }
             rows.add(encoded);
             rowsSeen++;
         }
-        return new Object[] { vars, rows };
+        return new Object[] { new ArrayList<>(varsSeen), rows };
     }
 
     /** Encode {@code result::ok(T)} — WIT discriminant + payload. */

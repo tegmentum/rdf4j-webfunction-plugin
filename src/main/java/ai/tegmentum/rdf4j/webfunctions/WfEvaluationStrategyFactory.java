@@ -57,6 +57,22 @@ public final class WfEvaluationStrategyFactory extends AbstractEvaluationStrateg
                 .orElseGet(() -> withTupleFunctionOptimizer(
                         new StandardQueryOptimizerPipeline(strategy, tripleSource, tfStats)));
         ((DefaultEvaluationStrategy) strategy).setOptimizerPipeline(pipeline);
+
+        // v0.3.0 host callbacks: bind the strategy + triple source so any
+        // FilterFunction / TupleFunction / aggregate fired during this
+        // strategy's evaluation can look them up via CallbackContext.current()
+        // and run recursive sub-queries. Bind here at strategy construction
+        // rather than at each evaluate() call — evaluate() returns a lazy
+        // iterator, and we want the binding to survive iteration.
+        //
+        // The binding leaks past the strategy's lifetime, which is fine:
+        // RDF4J constructs a fresh strategy per query, and the next strategy's
+        // bind() no-ops if a context is already present, then overrides on the
+        // NEXT query when the current one has closed. For strict cleanup,
+        // callers can invoke CallbackContext.unbind() between queries.
+        if (WebFunctionConfig.callbackEnabled()) {
+            CallbackContext.bind(strategy, tripleSource);
+        }
         return strategy;
     }
 
