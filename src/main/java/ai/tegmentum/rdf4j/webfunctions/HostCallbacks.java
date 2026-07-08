@@ -1,5 +1,13 @@
 package ai.tegmentum.rdf4j.webfunctions;
 
+import ai.tegmentum.wasmtime4j.wit.WitList;
+import ai.tegmentum.wasmtime4j.wit.WitOption;
+import ai.tegmentum.wasmtime4j.wit.WitRecord;
+import ai.tegmentum.wasmtime4j.wit.WitResult;
+import ai.tegmentum.wasmtime4j.wit.WitString;
+import ai.tegmentum.wasmtime4j.wit.WitType;
+import ai.tegmentum.wasmtime4j.wit.WitU32;
+import ai.tegmentum.wasmtime4j.wit.WitValue;
 import ai.tegmentum.webassembly4j.api.WitHostFunction;
 
 import org.eclipse.rdf4j.common.iteration.CloseableIteration;
@@ -8,36 +16,39 @@ import org.eclipse.rdf4j.query.BindingSet;
 import org.eclipse.rdf4j.query.impl.MapBindingSet;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 
 /**
- * Host callbacks satisfying the v0.3.0 WIT world's {@code host} import interface:
+ * Host callbacks satisfying the v0.3.0 WIT world's {@code host} import
+ * interface:
  * {@code stardog:webfunction/host@0.3.0#execute-query} and
- * {@code #callback-depth}. Each is packaged as a {@link WitHostFunction}
- * ({@code Object[] execute(Object[])}) so it can be registered on
- * {@code DefaultLinkingContext.builder().addWitHostFunction(name, fn)}.
+ * {@code stardog:webfunction/host@0.3.0#callback-depth}.
  *
- * <p>Input/output marshalling in this class works against boxed Java types
- * that mirror the WIT ADTs:
- *   <ul>
- *     <li>{@code string} → {@link String}
- *     <li>{@code u32} → {@link Integer}, {@code u64} → {@link Long}
- *     <li>{@code option<T>} → nullable {@code T}
- *     <li>{@code list<T>} → {@link List}{@code <T>}
- *     <li>{@code record}/{@code variant} → nested {@link Object}{@code []}
- *     <li>{@code result<T, E>} → {@code Object[]} with a boolean discriminant
- *   </ul>
- *
- * <p>The specific Object shapes wasmtime4j hands to and expects from
- * WitHostFunction implementations are still being verified end-to-end — the
- * boilerplate here is a scaffold; running components against it and adjusting
- * marshalling is the next concrete integration step.
+ * <p>Every {@code Object[]} that flows across the wasmtime4j {@code
+ * WitHostFunction} boundary must be a properly-typed {@link WitValue}
+ * instance — the same discipline {@link WitValueMarshaller} applies to
+ * VALUE_TYPE, extended here for {@code result<T, E>}, {@code option<u32>},
+ * and the {@code binding-sets} record.
  *
  * <p>Threading: both callbacks read from {@link CallbackContext#current()},
- * which the {@link Rdf4jWasmInstance} evaluator binds before instantiating
- * the component and unbinds in a finally block.
+ * which the {@link WfEvaluationStrategyFactory} binds at strategy
+ * construction so this is available for any FilterFunction / TupleFunction
+ * / aggregate fired during that strategy's evaluation.
  */
 public final class HostCallbacks {
+
+    // Composite WIT types the callbacks use.
+    static final WitType RESULT_TYPE;
+
+    static {
+        RESULT_TYPE = WitType.result(
+                Optional.of(WitValueMarshaller.BINDING_SETS_TYPE),
+                Optional.of(WitType.createString()));
+    }
 
     private HostCallbacks() {}
 
@@ -46,27 +57,28 @@ public final class HostCallbacks {
     public static WitHostFunction executeQuery() {
         return args -> {
             if (!WebFunctionConfig.callbackEnabled()) {
-                return errorResult("wf callback disabled by webfunctions.callback.enabled=false");
+                return new Object[] { err(
+                    "wf callback disabled by webfunctions.callback.enabled=false") };
             }
             final CallbackContext ctx = CallbackContext.current();
             if (ctx == null) {
-                return errorResult(
+                return new Object[] { err(
                     "wf callback: no strategy bound — install WfEvaluationStrategyFactory "
-                    + "on the sail to enable callbacks");
+                    + "on the sail to enable callbacks") };
             }
             try {
-                final String sparql = (String) args[0];
-                final BindingSet initial = decodeBindings(args[1], ctx);
-                final int rowCap = decodeOptionalU32(args[2]).orElseGet(ctx::maxRows);
+                final String sparql = ((WitString) args[0]).getValue();
+                final BindingSet initial = decodeBindings((WitList) args[1], ctx);
+                final int rowCap = decodeOptionalU32((WitOption) args[2]).orElseGet(ctx::maxRows);
 
                 ctx.enter();
                 try (CloseableIteration<BindingSet> iter = ctx.executeSelect(sparql, initial)) {
-                    return successResult(encodeResult(iter, rowCap));
+                    return new Object[] { ok(encodeBindingSets(iter, rowCap)) };
                 } finally {
                     ctx.exit();
                 }
             } catch (RuntimeException e) {
-                return errorResult(e.getMessage() == null ? e.toString() : e.getMessage());
+                return new Object[] { err(e.getMessage() == null ? e.toString() : e.getMessage()) };
             }
         };
     }
@@ -75,78 +87,87 @@ public final class HostCallbacks {
     public static WitHostFunction callbackDepth() {
         return args -> {
             final CallbackContext ctx = CallbackContext.current();
-            return new Object[] { ctx == null ? 0 : ctx.depth() };
+            return new Object[] { WitU32.of(ctx == null ? 0 : ctx.depth()) };
         };
     }
 
     // ---- marshalling helpers -------------------------------------------------
-    //
-    // The exact runtime shapes of Object arrays wasmtime4j hands us for lists
-    // of records and option/result ADTs are still being sanity-checked end-to-
-    // end. The methods below encode our best current understanding; they will
-    // very likely need small adjustments once a real component-invocation
-    // round trip is exercised.
+
+    private static WitResult ok(final WitRecord bindingSets) {
+        return WitResult.ok(RESULT_TYPE, bindingSets);
+    }
+
+    private static WitResult err(final String message) {
+        return WitResult.err(RESULT_TYPE, witString(message));
+    }
+
+    private static WitString witString(final String s) {
+        try {
+            return WitString.of(s);
+        } catch (ai.tegmentum.wasmtime4j.exception.ValidationException e) {
+            try {
+                // Fallback for a string with invalid UTF-8; unlikely for
+                // SPARQL-produced strings but defensive.
+                return WitString.of("wf callback: (unrepresentable string)");
+            } catch (ai.tegmentum.wasmtime4j.exception.ValidationException e2) {
+                throw new AssertionError("static fallback string rejected", e2);
+            }
+        }
+    }
 
     /**
-     * {@code list<binding>} is a Java {@link List} of Object[] rows; each row
-     * has slot 0 = name (string), slot 1 = value (variant of iri/literal/bnode
-     * per {@code WitValueMarshaller.VALUE_TYPE}).
+     * Decode a WIT {@code list<binding>} into an RDF4J BindingSet. Each element
+     * is a {@code record binding} with fields ("name": string, "value": value).
      */
-    @SuppressWarnings("unchecked")
-    private static BindingSet decodeBindings(final Object raw, final CallbackContext ctx) {
+    private static BindingSet decodeBindings(final WitList list, final CallbackContext ctx) {
         final MapBindingSet bs = new MapBindingSet();
-        if (raw == null) return bs;
-        final List<Object[]> entries = (List<Object[]>) raw;
-        for (Object[] entry : entries) {
-            final String name = (String) entry[0];
+        for (WitValue elem : list.getElements()) {
+            final WitRecord record = (WitRecord) elem;
+            final String name = ((WitString) record.getField("name")).getValue();
             final Value rdfValue = WitValueMarshaller.valueFromWit(
-                    (ai.tegmentum.wasmtime4j.wit.WitValue) entry[1],
-                    ctx.valueFactory());
+                    record.getField("value"), ctx.valueFactory());
             bs.addBinding(name, rdfValue);
         }
         return bs;
     }
 
-    private static java.util.OptionalInt decodeOptionalU32(final Object raw) {
-        if (raw == null) return java.util.OptionalInt.empty();
-        if (raw instanceof Integer i) return java.util.OptionalInt.of(i);
-        if (raw instanceof Long l) return java.util.OptionalInt.of(l.intValue());
-        return java.util.OptionalInt.empty();
+    /** {@code option<u32>} → {@link Optional} of int for our range. */
+    private static Optional<Integer> decodeOptionalU32(final WitOption option) {
+        final java.util.Optional<Object> raw = option.toJava();
+        return raw.map(o -> ((Number) o).intValue());
     }
 
     /**
-     * Encode a lazy {@link CloseableIteration} of {@link BindingSet}s as a
-     * WIT {@code binding-sets} record (Object[]): slot 0 = vars (list of
-     * strings), slot 1 = rows (list-of-list-of-Object[] bindings).
-     * Materialises up to {@code rowCap} rows, then drops the rest.
+     * Encode a lazy {@link CloseableIteration} of {@link BindingSet}s as a WIT
+     * {@code binding-sets} record. Materialises up to {@code rowCap} rows.
      */
-    private static Object[] encodeResult(final CloseableIteration<BindingSet> iter, final int rowCap) {
-        final java.util.LinkedHashSet<String> varsSeen = new java.util.LinkedHashSet<>();
-        final List<Object> rows = new ArrayList<>();
+    private static WitRecord encodeBindingSets(final CloseableIteration<BindingSet> iter,
+                                               final int rowCap) {
+        final LinkedHashSet<String> varsSeen = new LinkedHashSet<>();
+        final List<WitValue> rows = new ArrayList<>();
         int rowsSeen = 0;
         while (iter.hasNext() && rowsSeen < rowCap) {
             final BindingSet row = iter.next();
             varsSeen.addAll(row.getBindingNames());
-            final List<Object[]> encoded = new ArrayList<>();
+            final List<WitValue> bindings = new ArrayList<>();
             for (String var : row.getBindingNames()) {
                 final Value rdfValue = row.getValue(var);
                 if (rdfValue == null) continue;
-                final Object witValue = WitValueMarshaller.toWit(rdfValue);
-                encoded.add(new Object[] { var, witValue });
+                final WitRecord binding = WitRecord.builder()
+                        .field("name", witString(var))
+                        .field("value", WitValueMarshaller.toWit(rdfValue))
+                        .build();
+                bindings.add(binding);
             }
-            rows.add(encoded);
+            rows.add(WitList.of(bindings));
             rowsSeen++;
         }
-        return new Object[] { new ArrayList<>(varsSeen), rows };
-    }
+        final List<WitValue> vars = new ArrayList<>(varsSeen.size());
+        for (String v : varsSeen) vars.add(witString(v));
 
-    /** Encode {@code result::ok(T)} — WIT discriminant + payload. */
-    private static Object[] successResult(final Object payload) {
-        return new Object[] { Boolean.TRUE, payload };
-    }
-
-    /** Encode {@code result::err(string)}. */
-    private static Object[] errorResult(final String message) {
-        return new Object[] { Boolean.FALSE, message };
+        return WitRecord.builder()
+                .field("vars", WitList.of(vars))
+                .field("rows", WitList.of(rows))
+                .build();
     }
 }
