@@ -22,6 +22,10 @@ public final class WfServiceResolver implements FederatedServiceResolver {
 
     private final FederatedServiceResolver delegate;
     private final ConcurrentHashMap<String, WfCallService> cache = new ConcurrentHashMap<>();
+    // BGP-envelope handler is stateless across service URIs, so a single
+    // instance covers both the short-form and the full IRI. Lazily
+    // initialized under a lightweight double-checked-locking pattern.
+    private volatile WfCallFederatedService envelopeService;
 
     public WfServiceResolver(final FederatedServiceResolver delegate) {
         this.delegate = delegate;
@@ -29,6 +33,26 @@ public final class WfServiceResolver implements FederatedServiceResolver {
 
     @Override
     public FederatedService getService(final String serviceUrl) throws QueryEvaluationException {
+        // BGP-envelope form: `SERVICE <wf:call>` or the fully-qualified
+        // equivalent. The handler parses the SERVICE body itself to find
+        // the wasm URL + args + output columns, so we don't need per-URL
+        // caching here — one shared instance is enough.
+        if (WfCallFederatedService.SHORT_URI.equals(serviceUrl)
+                || WfCallFederatedService.FULL_URI.equals(serviceUrl)) {
+            WfCallFederatedService s = envelopeService;
+            if (s == null) {
+                synchronized (this) {
+                    s = envelopeService;
+                    if (s == null) {
+                        s = new WfCallFederatedService();
+                        s.initialize();
+                        envelopeService = s;
+                    }
+                }
+            }
+            return s;
+        }
+
         if (!WfCallService.matchesWasmUrl(serviceUrl)) {
             if (delegate == null) {
                 throw new QueryEvaluationException(
