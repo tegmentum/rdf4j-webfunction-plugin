@@ -96,6 +96,28 @@ public final class Rdf4jWasmInstance implements Closeable {
             linker.addWitHostFunction(
                 "stardog:webfunction/host@0.3.3#follow-predicate",
                 HostCallbacks.followPredicate());
+            // v0.4.0 additive imports — recursive wasm invocation.
+            linker.addWitHostFunction(
+                "stardog:webfunction/host@0.4.0#execute-query",
+                HostCallbacks.executeQuery());
+            linker.addWitHostFunction(
+                "stardog:webfunction/host@0.4.0#callback-depth",
+                HostCallbacks.callbackDepth());
+            linker.addWitHostFunction(
+                "stardog:webfunction/host@0.4.0#execute-update",
+                HostCallbacks.executeUpdate());
+            linker.addWitHostFunction(
+                "stardog:webfunction/host@0.4.0#prepare-query",
+                HostCallbacks.prepareQuery());
+            linker.addWitHostFunction(
+                "stardog:webfunction/host@0.4.0#run-prepared",
+                HostCallbacks.runPrepared());
+            linker.addWitHostFunction(
+                "stardog:webfunction/host@0.4.0#follow-predicate",
+                HostCallbacks.followPredicate());
+            linker.addWitHostFunction(
+                "stardog:webfunction/host@0.4.0#invoke-wasm",
+                HostCallbacks.invokeWasm());
         }
         this.instance = component.instantiate(linker.build());
     }

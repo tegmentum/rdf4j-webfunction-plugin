@@ -83,6 +83,92 @@ public final class HostCallbacks {
         };
     }
 
+    /**
+     * v0.4 {@code invoke-wasm: func(url: string, args: list<value>)
+     * -> result<binding-sets, string>}.
+     *
+     * <p>Recursively invokes another wasm component identified by
+     * {@code url}. The nested guest runs in a fresh
+     * {@link Rdf4jWasmInstance}; component instantiation is cached per
+     * URL by wasmtime4j, so back-to-back invocations reuse compiled
+     * components.
+     *
+     * <p>Uses {@link CallbackContext#valueFactory()} to construct RDF4J
+     * Values from the decoded WIT payload — the callback's outer
+     * TripleSource is what makes the nested guest's return Values
+     * shareable with the calling strategy.
+     */
+    public static WitHostFunction invokeWasm() {
+        return args -> {
+            if (!WebFunctionConfig.callbackEnabled()) {
+                return new Object[] { ComponentVal.err(ComponentVal.string(
+                    "wf callback disabled by webfunctions.callback.enabled=false")) };
+            }
+            final CallbackContext ctx = CallbackContext.current();
+            if (ctx == null) {
+                return new Object[] { ComponentVal.err(ComponentVal.string(
+                    "wf callback: invoke-wasm has no context bound — nested guest "
+                    + "was reached from a code path that didn't bind CallbackContext")) };
+            }
+            try {
+                final String url = ((ComponentVal) args[0]).asString();
+                final ComponentVal argsList = (ComponentVal) args[1];
+                final List<ComponentVal> inner = argsList.asList();
+                final ValueFactory vf = ctx.valueFactory();
+                final Value[] callArgs = new Value[inner.size()];
+                for (int i = 0; i < inner.size(); i++) {
+                    callArgs[i] = decodeValue(inner.get(i), vf);
+                }
+
+                ctx.enter();
+                try (Rdf4jWasmInstance instance =
+                        new Rdf4jWasmInstance(new java.net.URL(url))) {
+                    final List<WitValueMarshaller.Row> rows = instance.evaluate(vf, callArgs);
+                    return new Object[] { ComponentVal.ok(encodeRows(rows, ctx.maxRows())) };
+                } finally {
+                    ctx.exit();
+                }
+            } catch (Exception e) {
+                return new Object[] { ComponentVal.err(ComponentVal.string(
+                    "invoke-wasm: " + (e.getMessage() == null ? e.toString() : e.getMessage()))) };
+            }
+        };
+    }
+
+    /**
+     * Encode a {@link Rdf4jWasmInstance#evaluate} return (List<Row>)
+     * back into the WIT {@code binding-sets} record. Companion to the
+     * {@link CloseableIteration} overload; this one shapes the
+     * invoke-wasm response.
+     */
+    private static ComponentVal encodeRows(final List<WitValueMarshaller.Row> rows,
+                                           final int rowCap) {
+        final List<String> vars = rows.isEmpty() ? List.of() : rows.get(0).vars;
+        final List<ComponentVal> varsVals = new ArrayList<>();
+        for (String v : vars) varsVals.add(ComponentVal.string(v));
+
+        final List<ComponentVal> rowVals = new ArrayList<>();
+        int emitted = 0;
+        for (WitValueMarshaller.Row row : rows) {
+            if (emitted >= rowCap) break;
+            final List<ComponentVal> bindings = new ArrayList<>();
+            for (int i = 0; i < row.vars.size(); i++) {
+                final Value v = row.values.get(i);
+                if (v == null) continue;
+                final Map<String, ComponentVal> bindingFields = new LinkedHashMap<>();
+                bindingFields.put("name", ComponentVal.string(row.vars.get(i)));
+                bindingFields.put("value", encodeValue(v));
+                bindings.add(ComponentVal.record(bindingFields));
+            }
+            rowVals.add(ComponentVal.list(bindings));
+            emitted++;
+        }
+        final Map<String, ComponentVal> bs = new LinkedHashMap<>();
+        bs.put("vars", ComponentVal.list(varsVals));
+        bs.put("rows", ComponentVal.list(rowVals));
+        return ComponentVal.record(bs);
+    }
+
     /** {@code follow-predicate: func(subject: value, predicate: value)
      *  -> result<list<value>, string>}  (v0.3.3). */
     public static WitHostFunction followPredicate() {
