@@ -106,4 +106,44 @@ public final class WfEvaluationStrategyFactory extends AbstractEvaluationStrateg
             return combined;
         };
     }
+
+    /**
+     * Prepend the four engine-parity rewrite passes (partial &rarr;
+     * conversion &rarr; alias &rarr; shape) in front of the standard
+     * pipeline, after the tuple-function optimizer. Order matches
+     * {@code oxigraph-wf/src/main.rs} lines 630-665.
+     *
+     * <p>The returned pipeline wires the passes as
+     * {@link QueryOptimizer}s so RDF4J invokes them at optimize time,
+     * before any evaluation. For alias output rewrite, callers must
+     * still wrap the result iterator via
+     * {@link ai.tegmentum.rdf4j.webfunctions.rewrite.AliasRewriteState#wrap(org.eclipse.rdf4j.common.iteration.CloseableIteration)}.
+     */
+    public static QueryOptimizerPipeline withWebfunctionRewrites(
+            final QueryOptimizerPipeline base,
+            final ai.tegmentum.rdf4j.webfunctions.rewrite.InvokeRegistry invokeRegistry,
+            final ai.tegmentum.rdf4j.webfunctions.rewrite.ConversionRegistry conversionRegistry,
+            final ai.tegmentum.rdf4j.webfunctions.rewrite.AliasRewrite aliasRewrite,
+            final ai.tegmentum.rdf4j.webfunctions.rewrite.ShapeRegistry shapeRegistry,
+            final String wfFetchUrl) {
+        return () -> {
+            final List<QueryOptimizer> combined = new ArrayList<>();
+            combined.add(new WfCallTupleFunctionOptimizer());
+            if (invokeRegistry != null) {
+                combined.add(new ai.tegmentum.rdf4j.webfunctions.rewrite.PartialRewrite(invokeRegistry));
+            }
+            if (conversionRegistry != null && !conversionRegistry.isEmpty()) {
+                combined.add(new ai.tegmentum.rdf4j.webfunctions.rewrite.ConversionRewrite(conversionRegistry));
+            }
+            if (aliasRewrite != null) {
+                combined.add(aliasRewrite);
+            }
+            if (shapeRegistry != null && !shapeRegistry.isEmpty() && wfFetchUrl != null && !wfFetchUrl.isEmpty()) {
+                combined.add(new ai.tegmentum.rdf4j.webfunctions.rewrite.ShapeRewrite(shapeRegistry, wfFetchUrl));
+            }
+            final Iterator<QueryOptimizer> it = base.getOptimizers().iterator();
+            while (it.hasNext()) combined.add(it.next());
+            return combined;
+        };
+    }
 }
