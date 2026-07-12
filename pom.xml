@@ -65,7 +65,16 @@
             <groupId>org.eclipse.rdf4j</groupId>
             <artifactId>rdf4j-sail-memory</artifactId>
             <version>${rdf4j.version}</version>
-            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.eclipse.rdf4j</groupId>
+            <artifactId>rdf4j-rio-turtle</artifactId>
+            <version>${rdf4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.eclipse.rdf4j</groupId>
+            <artifactId>rdf4j-queryresultio-sparqljson</artifactId>
+            <version>${rdf4j.version}</version>
         </dependency>
 
         <dependency>
@@ -120,6 +129,17 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.5.2</version>
+            </plugin>
+            <!-- Cross-engine conformance runner. Invoke via
+                 mvn exec:java -Dexec.mainClass=ai.tegmentum.rdf4j.webfunctions.conformance.ConformanceMain
+                 with exec.args carrying the runner flags. -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.5.0</version>
+                <configuration>
+                    <mainClass>ai.tegmentum.rdf4j.webfunctions.conformance.ConformanceMain</mainClass>
+                </configuration>
             </plugin>
         </plugins>
     </build>

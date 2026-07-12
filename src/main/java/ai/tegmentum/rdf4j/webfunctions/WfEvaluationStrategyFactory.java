@@ -33,9 +33,10 @@ public final class WfEvaluationStrategyFactory extends AbstractEvaluationStrateg
 
     private final FederatedServiceResolver serviceResolver;
     private final org.eclipse.rdf4j.sail.Sail sail;
+    private final ai.tegmentum.rdf4j.webfunctions.rewrite.RewritePipeline rewritePipeline;
 
     public WfEvaluationStrategyFactory(final FederatedServiceResolver serviceResolver) {
-        this(serviceResolver, null);
+        this(serviceResolver, null, null);
     }
 
     /**
@@ -47,8 +48,28 @@ public final class WfEvaluationStrategyFactory extends AbstractEvaluationStrateg
      */
     public WfEvaluationStrategyFactory(final FederatedServiceResolver serviceResolver,
                                        final org.eclipse.rdf4j.sail.Sail sail) {
+        this(serviceResolver, sail, null);
+    }
+
+    /**
+     * Overload that also installs the four engine-parity rewrite passes
+     * (partial &rarr; conversion &rarr; alias &rarr; shape) at
+     * optimizer-pipeline setup time. The pipeline can be inspected
+     * after evaluation begins via
+     * {@link ai.tegmentum.rdf4j.webfunctions.rewrite.RewritePipeline#aliasState()}
+     * so the output-path rewriter can restore caller-facing aliases.
+     */
+    public WfEvaluationStrategyFactory(final FederatedServiceResolver serviceResolver,
+                                       final org.eclipse.rdf4j.sail.Sail sail,
+                                       final ai.tegmentum.rdf4j.webfunctions.rewrite.RewritePipeline rewritePipeline) {
         this.serviceResolver = serviceResolver;
         this.sail = sail;
+        this.rewritePipeline = rewritePipeline;
+    }
+
+    /** The engine-parity rewrite pipeline installed on this factory, or {@code null}. */
+    public ai.tegmentum.rdf4j.webfunctions.rewrite.RewritePipeline rewritePipeline() {
+        return rewritePipeline;
     }
 
     @Override
@@ -68,8 +89,16 @@ public final class WfEvaluationStrategyFactory extends AbstractEvaluationStrateg
         // If none was set we install our default pipeline that puts the
         // tuple-function optimizer in front of the standard optimizers.
         final QueryOptimizerPipeline pipeline = getOptimizerPipeline()
-                .orElseGet(() -> withTupleFunctionOptimizer(
-                        new StandardQueryOptimizerPipeline(strategy, tripleSource, tfStats)));
+                .orElseGet(() -> {
+                    final QueryOptimizerPipeline standard = new StandardQueryOptimizerPipeline(
+                            strategy, tripleSource, tfStats);
+                    // withWebfunctionRewrites already prepends
+                    // WfCallTupleFunctionOptimizer; use it alone when a
+                    // RewritePipeline is present so both live in one chain.
+                    return rewritePipeline == null
+                            ? withTupleFunctionOptimizer(standard)
+                            : withWebfunctionRewrites(standard, rewritePipeline);
+                });
         ((DefaultEvaluationStrategy) strategy).setOptimizerPipeline(pipeline);
 
         // v0.3.0 host callbacks: bind the strategy + triple source so any
@@ -141,6 +170,35 @@ public final class WfEvaluationStrategyFactory extends AbstractEvaluationStrateg
             if (shapeRegistry != null && !shapeRegistry.isEmpty() && wfFetchUrl != null && !wfFetchUrl.isEmpty()) {
                 combined.add(new ai.tegmentum.rdf4j.webfunctions.rewrite.ShapeRewrite(shapeRegistry, wfFetchUrl));
             }
+            final Iterator<QueryOptimizer> it = base.getOptimizers().iterator();
+            while (it.hasNext()) combined.add(it.next());
+            return combined;
+        };
+    }
+
+    /**
+     * Overload of {@link #withWebfunctionRewrites(QueryOptimizerPipeline,
+     * ai.tegmentum.rdf4j.webfunctions.rewrite.InvokeRegistry,
+     * ai.tegmentum.rdf4j.webfunctions.rewrite.ConversionRegistry,
+     * ai.tegmentum.rdf4j.webfunctions.rewrite.AliasRewrite,
+     * ai.tegmentum.rdf4j.webfunctions.rewrite.ShapeRegistry, String)}
+     * that takes a preconfigured
+     * {@link ai.tegmentum.rdf4j.webfunctions.rewrite.RewritePipeline}
+     * so the four passes share their engine-parity ordering and
+     * empty-registry short-circuiting via a single configuration point.
+     *
+     * <p>Callers hold onto the {@code pipeline} to reach the alias
+     * state (see
+     * {@link ai.tegmentum.rdf4j.webfunctions.rewrite.RewritePipeline#aliasState()})
+     * after evaluation begins.
+     */
+    public static QueryOptimizerPipeline withWebfunctionRewrites(
+            final QueryOptimizerPipeline base,
+            final ai.tegmentum.rdf4j.webfunctions.rewrite.RewritePipeline pipeline) {
+        return () -> {
+            final List<QueryOptimizer> combined = new ArrayList<>();
+            combined.add(new WfCallTupleFunctionOptimizer());
+            if (pipeline != null) combined.addAll(pipeline.optimizers());
             final Iterator<QueryOptimizer> it = base.getOptimizers().iterator();
             while (it.hasNext()) combined.add(it.next());
             return combined;
