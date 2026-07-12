@@ -1,6 +1,7 @@
 package ai.tegmentum.rdf4j.webfunctions.conformance;
 
 import ai.tegmentum.rdf4j.webfunctions.WfEvaluationStrategyFactory;
+import ai.tegmentum.rdf4j.webfunctions.WfServiceResolver;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.AliasMap;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.AliasRewriteState;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.ConversionRegistry;
@@ -89,7 +90,18 @@ public final class ConformanceMain {
         final MemoryStore store = new MemoryStore();
         // Install the pipeline before init() so the first strategy handed
         // out by createEvaluationStrategy() picks it up.
-        store.setEvaluationStrategyFactory(new WfEvaluationStrategyFactory(null, store, pipeline));
+        //
+        // The federated-service resolver is a WfServiceResolver with no
+        // delegate (the runner has no HTTP SPARQL federation to fall back
+        // to) and the pipeline's InvokeRegistry so wf-invoke:<hex> SERVICE
+        // refs — planted by PartialRewrite when it constant-folds
+        // wf:partial(...) — dispatch through WfInvokeService. A non-null
+        // resolver is also required to sidestep an RDF4J NPE inside
+        // ServiceQueryEvaluationStep.evaluate whenever any SERVICE clause
+        // reaches evaluation (which the ShapeRewrite pass always installs).
+        final WfServiceResolver resolver =
+                new WfServiceResolver(null, pipeline.invokeRegistry());
+        store.setEvaluationStrategyFactory(new WfEvaluationStrategyFactory(resolver, store, pipeline));
 
         final SailRepository repo = new SailRepository(store);
         repo.init();
