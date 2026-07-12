@@ -49,6 +49,7 @@ public final class RewritePipeline {
     private final InvokeRegistry invokeRegistry;
     private final ConversionRegistry conversionRegistry;
     private final AliasMap aliasMap;
+    private final FulltextRegistry fulltextRegistry;
     private final ShapeRegistry shapeRegistry;
     private final String wfFetchUrl;
 
@@ -63,6 +64,7 @@ public final class RewritePipeline {
         this.invokeRegistry     = b.invokeRegistry     == null ? new InvokeRegistry()      : b.invokeRegistry;
         this.conversionRegistry = b.conversionRegistry == null ? ConversionRegistry.empty(): b.conversionRegistry;
         this.aliasMap           = b.aliasMap           == null ? AliasMap.empty()          : b.aliasMap;
+        this.fulltextRegistry   = b.fulltextRegistry   == null ? FulltextRegistry.empty()  : b.fulltextRegistry;
         this.shapeRegistry      = b.shapeRegistry      == null ? ShapeRegistry.empty()     : b.shapeRegistry;
         this.wfFetchUrl         = b.wfFetchUrl;
         this.aliasRewrite       = new AliasRewrite(this.aliasMap);
@@ -73,6 +75,7 @@ public final class RewritePipeline {
     public InvokeRegistry     invokeRegistry()     { return invokeRegistry; }
     public ConversionRegistry conversionRegistry() { return conversionRegistry; }
     public AliasMap           aliasMap()           { return aliasMap; }
+    public FulltextRegistry   fulltextRegistry()   { return fulltextRegistry; }
     public ShapeRegistry      shapeRegistry()      { return shapeRegistry; }
     public String             wfFetchUrl()         { return wfFetchUrl; }
 
@@ -110,7 +113,7 @@ public final class RewritePipeline {
      * only the passes that would do work.
      */
     public List<QueryOptimizer> optimizers() {
-        final List<QueryOptimizer> out = new ArrayList<>(4);
+        final List<QueryOptimizer> out = new ArrayList<>(5);
         // Order matches oxigraph-wf/src/main.rs 630-665.
         if (invokeRegistry != null) {
             out.add(new PartialRewrite(invokeRegistry));
@@ -120,6 +123,13 @@ public final class RewritePipeline {
         }
         if (aliasMap != null && !aliasMap.isEmpty()) {
             out.add(aliasRewrite);
+        }
+        // FulltextRewrite runs after Alias (so aliased predicate IRIs are
+        // canonicalized before the registry lookup) and before Shape (so
+        // shape-covered BGPs are still folded on a tree that may have
+        // acquired a SERVICE child from filter-fold).
+        if (fulltextRegistry != null && !fulltextRegistry.isEmpty() && invokeRegistry != null) {
+            out.add(new FulltextRewrite(fulltextRegistry, invokeRegistry));
         }
         if (shapeRegistry != null && !shapeRegistry.isEmpty()
                 && wfFetchUrl != null && !wfFetchUrl.isEmpty()) {
@@ -138,6 +148,7 @@ public final class RewritePipeline {
     public boolean isEmpty() {
         return (conversionRegistry == null || conversionRegistry.isEmpty())
                 && (aliasMap == null           || aliasMap.isEmpty())
+                && (fulltextRegistry == null   || fulltextRegistry.isEmpty())
                 && (shapeRegistry == null      || shapeRegistry.isEmpty());
     }
 
@@ -145,12 +156,14 @@ public final class RewritePipeline {
         private InvokeRegistry invokeRegistry;
         private ConversionRegistry conversionRegistry;
         private AliasMap aliasMap;
+        private FulltextRegistry fulltextRegistry;
         private ShapeRegistry shapeRegistry;
         private String wfFetchUrl;
 
         public Builder invokeRegistry(final InvokeRegistry r)         { this.invokeRegistry = r; return this; }
         public Builder conversionRegistry(final ConversionRegistry r) { this.conversionRegistry = r; return this; }
         public Builder aliasMap(final AliasMap m)                     { this.aliasMap = m; return this; }
+        public Builder fulltextRegistry(final FulltextRegistry r)     { this.fulltextRegistry = r; return this; }
         public Builder shapeRegistry(final ShapeRegistry r)           { this.shapeRegistry = r; return this; }
         public Builder wfFetchUrl(final String url)                   { this.wfFetchUrl = url; return this; }
 
