@@ -95,9 +95,11 @@ public class ConformanceMainDocumentTest {
     }
 
     /**
-     * A malformed document config (revision_retention = "all", which is
-     * gated to v1.0) exits with a distinct config-error path. Confirms
-     * the parser's v0.2-gate error message reaches the runner.
+     * A malformed document config (unrecognised revision_retention
+     * value) exits with a distinct config-error path. v1.0 accepts
+     * {@code "latest"} and {@code "all"} — anything else is a hard
+     * reject, and this test confirms the parser's rejection reaches the
+     * runner.
      */
     @Test
     public void runnerRejectsInvalidDocumentConfig() throws Exception {
@@ -112,15 +114,15 @@ public class ConformanceMainDocumentTest {
             Files.writeString(documentConfig, """
                     {
                       "documents": [{
-                        "name": "greedy",
+                        "name": "weird",
                         "mode": "managed",
                         "guest_url": "file:///g.wasm",
                         "search_backend": "s",
                         "storage_backend": "st",
-                        "search_index": "greedy",
+                        "search_index": "weird",
                         "sirix_database": "docs",
-                        "sirix_resource": "greedy",
-                        "revision_retention": "all"
+                        "sirix_resource": "weird",
+                        "revision_retention": "sometimes"
                       }]
                     }
                     """, StandardCharsets.UTF_8);
@@ -131,7 +133,7 @@ public class ConformanceMainDocumentTest {
                     "--document-config", documentConfig.toString());
             assertThat(r.exitCode).isEqualTo(2);
             assertThat(r.stderr).contains("document config error");
-            assertThat(r.stderr).contains("v0.2");
+            assertThat(r.stderr).contains("revision_retention");
         } finally {
             deleteRecursively(tmp);
         }

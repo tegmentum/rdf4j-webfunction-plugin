@@ -220,15 +220,14 @@ public final class DocumentRegistry {
                 }
                 final String retention = raw.get("revision_retention").asString();
                 switch (retention) {
-                    case "latest" -> revisionRetention = retention;
-                    case "all" -> throw new IllegalArgumentException(
-                            "document registry entry `" + name + "`: `revision_retention`: "
-                                    + "\"all\" is not supported in v0.2 (time-travel search "
-                                    + "is deferred to v1.0); use \"latest\"");
+                    // v1.0 lift: "all" is now a valid retention mode. Enables
+                    // time-travel search by mirroring every revision of every
+                    // document to the search backend (memo §03 + §10).
+                    case "latest", "all" -> revisionRetention = retention;
                     default -> throw new IllegalArgumentException(
                             "document registry entry `" + name + "`: unknown "
                                     + "`revision_retention` `" + retention + "` "
-                                    + "(v0.2 accepts only `latest`)");
+                                    + "(accepts `latest` or `all`)");
                 }
             }
             case FEDERATED -> {

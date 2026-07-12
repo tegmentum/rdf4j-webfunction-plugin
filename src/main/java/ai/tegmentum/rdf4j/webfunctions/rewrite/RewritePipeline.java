@@ -50,6 +50,7 @@ public final class RewritePipeline {
     private final ConversionRegistry conversionRegistry;
     private final AliasMap aliasMap;
     private final FulltextRegistry fulltextRegistry;
+    private final DocumentRegistry documentRegistry;
     private final ShapeRegistry shapeRegistry;
     private final String wfFetchUrl;
 
@@ -65,6 +66,7 @@ public final class RewritePipeline {
         this.conversionRegistry = b.conversionRegistry == null ? ConversionRegistry.empty(): b.conversionRegistry;
         this.aliasMap           = b.aliasMap           == null ? AliasMap.empty()          : b.aliasMap;
         this.fulltextRegistry   = b.fulltextRegistry   == null ? FulltextRegistry.empty()  : b.fulltextRegistry;
+        this.documentRegistry   = b.documentRegistry   == null ? DocumentRegistry.empty()  : b.documentRegistry;
         this.shapeRegistry      = b.shapeRegistry      == null ? ShapeRegistry.empty()     : b.shapeRegistry;
         this.wfFetchUrl         = b.wfFetchUrl;
         this.aliasRewrite       = new AliasRewrite(this.aliasMap);
@@ -76,6 +78,7 @@ public final class RewritePipeline {
     public ConversionRegistry conversionRegistry() { return conversionRegistry; }
     public AliasMap           aliasMap()           { return aliasMap; }
     public FulltextRegistry   fulltextRegistry()   { return fulltextRegistry; }
+    public DocumentRegistry   documentRegistry()   { return documentRegistry; }
     public ShapeRegistry      shapeRegistry()      { return shapeRegistry; }
     public String             wfFetchUrl()         { return wfFetchUrl; }
 
@@ -131,6 +134,14 @@ public final class RewritePipeline {
         if (fulltextRegistry != null && !fulltextRegistry.isEmpty() && invokeRegistry != null) {
             out.add(new FulltextRewrite(fulltextRegistry, invokeRegistry));
         }
+        // WfSearchRewrite runs between Alias and Shape too — same
+        // reasoning: aliased document-index names get canonicalised
+        // before the registry lookup, and the SERVICE URL sugar becomes
+        // a wf-invoke:<hex> allocation before ShapeRewrite decides
+        // whether to fold any surrounding BGP.
+        if (documentRegistry != null && !documentRegistry.isEmpty() && invokeRegistry != null) {
+            out.add(new WfSearchRewrite(documentRegistry, invokeRegistry));
+        }
         if (shapeRegistry != null && !shapeRegistry.isEmpty()
                 && wfFetchUrl != null && !wfFetchUrl.isEmpty()) {
             out.add(new ShapeRewrite(shapeRegistry, wfFetchUrl));
@@ -149,6 +160,7 @@ public final class RewritePipeline {
         return (conversionRegistry == null || conversionRegistry.isEmpty())
                 && (aliasMap == null           || aliasMap.isEmpty())
                 && (fulltextRegistry == null   || fulltextRegistry.isEmpty())
+                && (documentRegistry == null   || documentRegistry.isEmpty())
                 && (shapeRegistry == null      || shapeRegistry.isEmpty());
     }
 
@@ -157,6 +169,7 @@ public final class RewritePipeline {
         private ConversionRegistry conversionRegistry;
         private AliasMap aliasMap;
         private FulltextRegistry fulltextRegistry;
+        private DocumentRegistry documentRegistry;
         private ShapeRegistry shapeRegistry;
         private String wfFetchUrl;
 
@@ -164,6 +177,7 @@ public final class RewritePipeline {
         public Builder conversionRegistry(final ConversionRegistry r) { this.conversionRegistry = r; return this; }
         public Builder aliasMap(final AliasMap m)                     { this.aliasMap = m; return this; }
         public Builder fulltextRegistry(final FulltextRegistry r)     { this.fulltextRegistry = r; return this; }
+        public Builder documentRegistry(final DocumentRegistry r)     { this.documentRegistry = r; return this; }
         public Builder shapeRegistry(final ShapeRegistry r)           { this.shapeRegistry = r; return this; }
         public Builder wfFetchUrl(final String url)                   { this.wfFetchUrl = url; return this; }
 

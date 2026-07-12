@@ -110,11 +110,10 @@ public final class ConformanceMain {
                     + " fulltext index(es) from " + parsed.fulltextConfig);
         }
 
-        // Document registry is loaded independently of the rewrite
-        // pipeline: v0.2 wires only the parse + validation surface;
-        // wf_document is invoked exclusively through explicit
-        // SERVICE ?svc (memo §11.6), so there is no companion rewrite
-        // pass in this release.
+        // Document registry powers both administrative lookup and the
+        // v1.0 wf-search: SERVICE URL sugar. When populated it is spliced
+        // into the RewritePipeline so WfSearchRewrite can allocate
+        // wf-invoke:<hex> IRIs at plan time.
         final DocumentRegistry documentRegistry;
         try {
             documentRegistry = parsed.documentConfig == null
@@ -129,7 +128,7 @@ public final class ConformanceMain {
                     + " document(s) from " + parsed.documentConfig);
         }
 
-        final RewritePipeline pipeline = loadPipeline(parsed, err);
+        final RewritePipeline pipeline = loadPipeline(parsed, documentRegistry, err);
         if (pipeline == null) return 2;
 
         final MemoryStore store = new MemoryStore();
@@ -226,12 +225,13 @@ public final class ConformanceMain {
 
     // ---- config loading ---------------------------------------------------
 
-    static RewritePipeline loadPipeline(final Args a, final PrintStream err) {
+    static RewritePipeline loadPipeline(final Args a, final DocumentRegistry documentRegistry, final PrintStream err) {
         try {
             final RewritePipeline.Builder b = RewritePipeline.builder();
             if (a.aliasConfig      != null) b.aliasMap(loadAliasMap(a.aliasConfig));
             if (a.conversionConfig != null) b.conversionRegistry(loadConversionRegistry(a.conversionConfig));
             if (a.shapeConfig      != null) b.shapeRegistry(loadShapeRegistry(a.shapeConfig));
+            if (documentRegistry   != null && !documentRegistry.isEmpty()) b.documentRegistry(documentRegistry);
             if (a.partialConfig    != null) {
                 final JsonNode root = MAPPER.readTree(Files.readString(a.partialConfig));
                 if (root.hasNonNull("wf_fetch_url")) {

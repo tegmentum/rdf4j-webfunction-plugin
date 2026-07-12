@@ -394,13 +394,13 @@ public class TestDocumentRegistry {
     }
 
     /**
-     * v0.2 gate: {@code "all"} is deferred to v1.0 alongside
-     * time-travel search (memo §10). Reject with a message that names
-     * v0.2 explicitly so operators understand this is a gate, not a typo.
+     * v1.0 lift: {@code "all"} is now accepted (memo §10). Time-travel
+     * search rides on top of the retention=all sweep — the config parse
+     * has to let it through so the operator can opt in.
      */
     @Test
-    public void rejectsRevisionRetentionAllInV02() {
-        assertThatThrownBy(() -> parse("""
+    public void acceptsRevisionRetentionAll() {
+        final DocumentRegistry reg = parse("""
                 {
                   "documents": [{
                     "name": "greedy",
@@ -413,11 +413,10 @@ public class TestDocumentRegistry {
                     "sirix_resource": "x",
                     "revision_retention": "all"
                   }]
-                }"""))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("greedy")
-                .hasMessageContaining("v0.2")
-                .hasMessageContaining("revision_retention");
+                }""");
+        final DocumentIndex e = reg.byName("greedy");
+        assertThat(e).isNotNull();
+        assertThat(e.revisionRetention()).isEqualTo("all");
     }
 
     @Test
