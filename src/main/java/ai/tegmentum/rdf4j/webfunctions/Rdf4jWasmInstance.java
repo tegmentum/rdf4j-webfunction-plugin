@@ -33,11 +33,28 @@ public final class Rdf4jWasmInstance implements Closeable {
     private static final Object ENGINE_LOCK = new Object();
     private static final ConcurrentHashMap<URL, Component> COMPONENT_CACHE =
             new ConcurrentHashMap<>();
+    /**
+     * Per-URL cache of the resolved entry-point name once we've seen a
+     * given component. Mirrors the component cache, but populated
+     * lazily on first successful instantiation instead of at load time
+     * (webassembly4j's public {@code Component} API exposes exported
+     * <em>interfaces</em>, not exported function names — the function
+     * list only surfaces on the {@code ComponentInstance}).
+     *
+     * <p>Keyed by URL to survive the fact that each invocation builds a
+     * fresh {@code ComponentInstance}: once the resolver has picked
+     * {@code evaluate} (or {@code search}, or a caller override) for a
+     * given URL, subsequent calls short-circuit the enumeration.
+     */
+    private static final ConcurrentHashMap<URL, String> AUTO_ENTRY_CACHE =
+            new ConcurrentHashMap<>();
 
     private ComponentInstance instance;
+    private final URL wasmUrl;
     private boolean closed;
 
     public Rdf4jWasmInstance(final URL wasmUrl) throws IOException {
+        this.wasmUrl = wasmUrl;
         final Component component = componentFor(wasmUrl);
         final DefaultLinkingContext.Builder linker = DefaultLinkingContext.builder();
         // v0.3.0 host callbacks: only bound if enabled by config. Older
@@ -198,9 +215,49 @@ public final class Rdf4jWasmInstance implements Closeable {
     }
 
     public List<WitValueMarshaller.Row> evaluate(final ValueFactory vf, final Value... args) throws IOException {
+        return invokeEntry(null, vf, args);
+    }
+
+    /**
+     * Invoke a specific export by name, or auto-detect one via
+     * {@link EntryPointResolver} when {@code entryPointOverride} is
+     * {@code null}. See the class Javadoc on {@link EntryPointResolver}
+     * for the resolution order.
+     *
+     * <p>Same shape as {@link #evaluate(ValueFactory, Value...)} — the
+     * caller path used by {@link WfInvokeService} when an
+     * {@code InvokeSpec.entryPoint} override was supplied at
+     * {@code wf:partial} rewrite time.
+     */
+    public List<WitValueMarshaller.Row> invokeEntry(final String entryPointOverride,
+                                                    final ValueFactory vf,
+                                                    final Value... args) throws IOException {
+        final String entry = resolveEntryPoint(entryPointOverride);
         final WitValue result = (WitValue) instance.invokeWit(
-                "evaluate", WitValueMarshaller.toWitArgs(args));
+                entry, WitValueMarshaller.toWitArgs(args));
         return WitValueMarshaller.bindingSetsFromWit(unwrapOk(result), vf);
+    }
+
+    /**
+     * Enumerate the underlying component's exported top-level function
+     * names. Handy for callers that want to inspect a guest's contract
+     * before invoking (e.g. the substrate resolver, tests).
+     */
+    public List<String> exportedFunctions() {
+        return instance.exportedFunctions();
+    }
+
+    private String resolveEntryPoint(final String override) {
+        if (override != null && !override.isEmpty()) {
+            return override;
+        }
+        // Cache the auto-detected name per URL; the enumeration is cheap
+        // but there's no reason to repeat it every wf:partial dispatch.
+        final String cached = AUTO_ENTRY_CACHE.get(wasmUrl);
+        if (cached != null) return cached;
+        final String resolved = EntryPointResolver.resolve(instance.exportedFunctions(), null);
+        AUTO_ENTRY_CACHE.putIfAbsent(wasmUrl, resolved);
+        return resolved;
     }
 
     public void aggregateStep(final Value[] args, final long multiplicity) throws IOException {
@@ -260,6 +317,7 @@ public final class Rdf4jWasmInstance implements Closeable {
     static void resetCache() {
         COMPONENT_CACHE.forEach((k, c) -> c.close());
         COMPONENT_CACHE.clear();
+        AUTO_ENTRY_CACHE.clear();
         synchronized (ENGINE_LOCK) {
             if (SHARED_ENGINE != null) {
                 SHARED_ENGINE.close();

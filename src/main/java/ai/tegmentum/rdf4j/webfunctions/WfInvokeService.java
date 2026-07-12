@@ -136,7 +136,12 @@ public final class WfInvokeService implements FederatedService {
 
         final List<WitValueMarshaller.Row> rows;
         try (Rdf4jWasmInstance instance = new Rdf4jWasmInstance(wasmUrl)) {
-            rows = instance.evaluate(VF, argArr);
+            // Honor a caller-supplied entry-point override (populated by
+            // rewrite passes that know the target guest's WIT world
+            // exports something other than `evaluate` — e.g.
+            // wf_fulltext exports `search`). Null routes through
+            // Rdf4jWasmInstance's auto-detect path.
+            rows = instance.invokeEntry(spec.entryPoint(), VF, argArr);
         } catch (IOException e) {
             throw new QueryEvaluationException(
                     "wf-invoke: SERVICE failed: " + e.getMessage(), e);

@@ -5,6 +5,7 @@ import ai.tegmentum.rdf4j.webfunctions.WfServiceResolver;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.AliasMap;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.AliasRewriteState;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.ConversionRegistry;
+import ai.tegmentum.rdf4j.webfunctions.rewrite.FulltextRegistry;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.RewritePipeline;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.ShapeEntry;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.ShapeRegistry;
@@ -45,6 +46,7 @@ import java.util.Map;
  *   --shape-config      &lt;path.json&gt;   (optional)
  *   --conversion-config &lt;path.json&gt;   (optional)
  *   --partial-config    &lt;path.json&gt;   (optional)
+ *   --fulltext-config   &lt;path.json&gt;   (optional)
  * </pre>
  *
  * <p>Exits {@code 0} on success. A non-zero exit code plus a message on
@@ -83,6 +85,28 @@ public final class ConformanceMain {
     public static int run(final String[] args, final PrintStream out, final PrintStream err) throws Exception {
         final Args parsed = parseArgs(args, err);
         if (parsed == null) return 2;
+
+        // Fulltext registry is loaded independently of the rewrite
+        // pipeline: it stores config only, and the filter-fold rewrite
+        // pass that consumes it is a separate follow-up. Presence of
+        // the flag exercises the parser + validation surface end-to-end;
+        // absence keeps the runner identical to the pre-fulltext build.
+        final FulltextRegistry fulltextRegistry;
+        try {
+            fulltextRegistry = parsed.fulltextConfig == null
+                    ? FulltextRegistry.empty()
+                    : FulltextRegistry.loadFromJson(parsed.fulltextConfig);
+        } catch (Exception e) {
+            err.println("fulltext config error: " + e.getMessage());
+            return 2;
+        }
+        // Diagnostic on stderr so the parity harness (and the
+        // ConformanceMainFulltextTest) can assert the registry
+        // populated correctly without smuggling state through a static.
+        if (parsed.fulltextConfig != null) {
+            err.println("loaded " + fulltextRegistry.size()
+                    + " fulltext index(es) from " + parsed.fulltextConfig);
+        }
 
         final RewritePipeline pipeline = loadPipeline(parsed, err);
         if (pipeline == null) return 2;
@@ -133,13 +157,14 @@ public final class ConformanceMain {
 
     // ---- argument parsing -------------------------------------------------
 
-    private static final class Args {
+    static final class Args {
         Path data;
         Path query;
         Path aliasConfig;
         Path shapeConfig;
         Path conversionConfig;
         Path partialConfig;
+        Path fulltextConfig;
     }
 
     static Args parseArgs(final String[] argv, final PrintStream err) {
@@ -158,6 +183,7 @@ public final class ConformanceMain {
                 case "--shape-config"      -> a.shapeConfig = Path.of(value);
                 case "--conversion-config" -> a.conversionConfig = Path.of(value);
                 case "--partial-config"    -> a.partialConfig = Path.of(value);
+                case "--fulltext-config"   -> a.fulltextConfig = Path.of(value);
                 default -> {
                     err.println("unknown argument: " + flag);
                     return null;
