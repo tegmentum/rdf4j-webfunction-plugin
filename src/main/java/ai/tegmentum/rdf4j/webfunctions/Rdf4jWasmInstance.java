@@ -118,7 +118,48 @@ public final class Rdf4jWasmInstance implements Closeable {
             linker.addWitHostFunction(
                 "stardog:webfunction/host@0.4.0#invoke-wasm",
                 HostCallbacks.invokeWasm());
+            // v0.5.0 additive imports — sink handles (sqlite/duckdb/…) plus
+            // execute-update's simplified one-arg signature. Additive: v0.4
+            // guests keep linking against their own registrations above.
+            linker.addWitHostFunction(
+                "stardog:webfunction/host@0.5.0#execute-query",
+                HostCallbacks.executeQuery());
+            linker.addWitHostFunction(
+                "stardog:webfunction/host@0.5.0#callback-depth",
+                HostCallbacks.callbackDepth());
+            linker.addWitHostFunction(
+                "stardog:webfunction/host@0.5.0#prepare-query",
+                HostCallbacks.prepareQuery());
+            linker.addWitHostFunction(
+                "stardog:webfunction/host@0.5.0#run-prepared",
+                HostCallbacks.runPrepared());
+            linker.addWitHostFunction(
+                "stardog:webfunction/host@0.5.0#invoke-wasm",
+                HostCallbacks.invokeWasm());
+            linker.addWitHostFunction(
+                "stardog:webfunction/host@0.5.0#execute-update",
+                HostCallbacks.executeUpdateV05());
+            linker.addWitHostFunction(
+                "stardog:webfunction/host@0.5.0#sink-open",
+                HostCallbacks.sinkOpen());
+            linker.addWitHostFunction(
+                "stardog:webfunction/host@0.5.0#sink-execute",
+                HostCallbacks.sinkExecute());
+            linker.addWitHostFunction(
+                "stardog:webfunction/host@0.5.0#sink-close",
+                HostCallbacks.sinkClose());
         }
+        // wf:fulltext/host@0.1.0 — one import, `http-post-json`. The
+        // wf_fulltext guest declares its own WIT world (versioned under
+        // wf:fulltext, not stardog:webfunction), so this binds independently
+        // of the callback-enabled flag: the flag gates re-entry into the
+        // outer graph, this import reaches an external fulltext backend.
+        // Guests that never import wf:fulltext see no change in behaviour —
+        // the wasm engine only pulls what a component's imports section
+        // names.
+        linker.addWitHostFunction(
+            "wf:fulltext/host@0.1.0#http-post-json",
+            HostCallbacks.httpPostJson());
         this.instance = component.instantiate(linker.build());
     }
 
