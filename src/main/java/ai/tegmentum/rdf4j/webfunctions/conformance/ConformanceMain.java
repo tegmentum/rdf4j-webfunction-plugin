@@ -5,6 +5,7 @@ import ai.tegmentum.rdf4j.webfunctions.WfServiceResolver;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.AliasMap;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.AliasRewriteState;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.ConversionRegistry;
+import ai.tegmentum.rdf4j.webfunctions.rewrite.DocumentRegistry;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.FulltextRegistry;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.RewritePipeline;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.ShapeEntry;
@@ -47,6 +48,7 @@ import java.util.Map;
  *   --conversion-config &lt;path.json&gt;   (optional)
  *   --partial-config    &lt;path.json&gt;   (optional)
  *   --fulltext-config   &lt;path.json&gt;   (optional)
+ *   --document-config   &lt;path.json&gt;   (optional)
  * </pre>
  *
  * <p>Exits {@code 0} on success. A non-zero exit code plus a message on
@@ -108,6 +110,25 @@ public final class ConformanceMain {
                     + " fulltext index(es) from " + parsed.fulltextConfig);
         }
 
+        // Document registry is loaded independently of the rewrite
+        // pipeline: v0.2 wires only the parse + validation surface;
+        // wf_document is invoked exclusively through explicit
+        // SERVICE ?svc (memo §11.6), so there is no companion rewrite
+        // pass in this release.
+        final DocumentRegistry documentRegistry;
+        try {
+            documentRegistry = parsed.documentConfig == null
+                    ? DocumentRegistry.empty()
+                    : DocumentRegistry.loadFromJson(parsed.documentConfig);
+        } catch (Exception e) {
+            err.println("document config error: " + e.getMessage());
+            return 2;
+        }
+        if (parsed.documentConfig != null) {
+            err.println("loaded " + documentRegistry.size()
+                    + " document(s) from " + parsed.documentConfig);
+        }
+
         final RewritePipeline pipeline = loadPipeline(parsed, err);
         if (pipeline == null) return 2;
 
@@ -165,6 +186,7 @@ public final class ConformanceMain {
         Path conversionConfig;
         Path partialConfig;
         Path fulltextConfig;
+        Path documentConfig;
     }
 
     static Args parseArgs(final String[] argv, final PrintStream err) {
@@ -184,6 +206,7 @@ public final class ConformanceMain {
                 case "--conversion-config" -> a.conversionConfig = Path.of(value);
                 case "--partial-config"    -> a.partialConfig = Path.of(value);
                 case "--fulltext-config"   -> a.fulltextConfig = Path.of(value);
+                case "--document-config"   -> a.documentConfig = Path.of(value);
                 default -> {
                     err.println("unknown argument: " + flag);
                     return null;
