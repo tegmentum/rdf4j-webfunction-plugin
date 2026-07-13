@@ -47,6 +47,44 @@ public class TestShapeRewrite {
         assertThat(collectServices(parsed.getTupleExpr())).hasSize(1);
     }
 
+    /**
+     * Regression: after a prior federation pass lifts one triple pattern
+     * into a {@link Service} and joins it as a sibling of the residual
+     * shape-eligible SPs, the shape rewrite must still fire on those
+     * residuals (wf-conformance {@code federation_wf_fetch.toml}).
+     * Prior to this fix, {@code meet(Join)} required a "pure BGP"
+     * subtree and refused to descend past the Service sibling.
+     */
+    @Test
+    public void rewritesResidualBgpAlongsideSiblingService() {
+        // Simulate a post-federation algebra: a wf-federation source
+        // has already been lifted into SERVICE, sitting as a sibling of
+        // the shape-eligible SPs. Injecting SERVICE via SPARQL text is
+        // the simplest way to build that shape.
+        final String query = ""
+                + "SELECT ?s ?n ?a ?label WHERE {\n"
+                + "  SERVICE <http://example/labels> { ?s <http://example/label> ?label . }\n"
+                + "  ?s <http://example/name> ?n .\n"
+                + "  ?s <http://example/age>  ?a .\n"
+                + "}";
+        final ParsedQuery parsed = new SPARQLParser().parseQuery(query, null);
+        final ShapeRegistry registry = ShapeRegistry.of(List.of(personShape()));
+        final ShapeRewrite rewrite = new ShapeRewrite(registry, "http://wf/fetch.wasm");
+        final int count = rewrite.rewritePattern(parsed.getTupleExpr());
+
+        assertThat(count).isEqualTo(1);
+        // Two Services now: the pre-existing federation Service (the
+        // one against http://example/labels) and the wf:call Service
+        // the shape rewrite just emitted.
+        final List<Service> services = collectServices(parsed.getTupleExpr());
+        assertThat(services).hasSize(2);
+        final List<String> refs = services.stream()
+                .map(s -> s.getServiceRef().getValue().stringValue())
+                .toList();
+        assertThat(refs).contains("http://example/labels");
+        assertThat(refs).anyMatch(r -> r.endsWith("/ns/webfunction/call"));
+    }
+
     @Test
     public void skipsBgpWithForeignPredicate() {
         final String query = ""

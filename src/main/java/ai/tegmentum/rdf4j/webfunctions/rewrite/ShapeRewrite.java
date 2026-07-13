@@ -75,22 +75,75 @@ public final class ShapeRewrite implements QueryOptimizer {
 
         @Override
         public void meet(final Join node) {
-            // If this Join subtree is a "pure BGP" (only SPs and Joins),
-            // decide once for the whole BGP: either rewrite it wholesale
-            // or leave it entirely alone. Recursing into children on a
-            // mixed BGP is the wrong semantic &mdash; the reference
-            // implementation only touches Bgp nodes, never individual
-            // triples inside a BGP.
-            final List<StatementPattern> collected = new ArrayList<>();
-            if (collectPureBgp(node, collected)) {
-                final TupleExpr rewritten = tryRewrite(collected);
-                if (rewritten != null) {
-                    node.replaceWith(rewritten);
-                    rewrites++;
-                }
-                return; // pure-BGP subtree owned by this decision either way
+            // Only the topmost Join in a flat Join-tree drives the
+            // rewrite &mdash; defer descendants so we flatten the whole
+            // Join tree in one place.
+            if (node.getParentNode() instanceof Join) {
+                super.meet(node);
+                return;
             }
-            super.meet(node);
+
+            // Flatten the Join subtree into siblings. A Service node
+            // (e.g. one emitted by a prior federation pass) is an opaque
+            // sibling: we don't descend into it, but its presence must
+            // not disqualify neighbouring shape-eligible SPs. RDF4J's
+            // algebra has no explicit Bgp boundary, so this is the only
+            // point where we can re-identify "these SPs form a BGP even
+            // though a Service is joined next to them" (see wf-conformance
+            // federation_wf_fetch.toml).
+            final List<TupleExpr> parts = new ArrayList<>();
+            flattenJoinTree(node, parts);
+
+            final List<StatementPattern> sps = new ArrayList<>();
+            final List<TupleExpr> opaques = new ArrayList<>();
+            for (TupleExpr p : parts) {
+                if (p instanceof StatementPattern sp) sps.add(sp);
+                else opaques.add(p);
+            }
+
+            if (!sps.isEmpty()) {
+                final TupleExpr rewritten = tryRewrite(sps);
+                if (rewritten != null) {
+                    // Rebuild as Join(opaques..., rewritten). Ordering
+                    // matters: the opaques (typically a federation
+                    // Service against a real SPARQL endpoint) go on the
+                    // left so RDF4J evaluates them first &mdash;
+                    // otherwise the wf:call output would be pushed as
+                    // a VALUES block into a remote query that not
+                    // every endpoint (and none of the mock endpoints
+                    // used in wf-conformance federation_wf_fetch.toml)
+                    // supports. Re-parent existing opaques directly
+                    // rather than cloning: RDF4J's Service holds a
+                    // raw serviceExpressionString + prefixDeclarations
+                    // that must survive intact for
+                    // SPARQLFederatedService to POST the correct body.
+                    final List<TupleExpr> rebuiltParts = new ArrayList<>(opaques.size() + 1);
+                    rebuiltParts.addAll(opaques);
+                    rebuiltParts.add(rewritten);
+                    node.replaceWith(joinAllExpr(rebuiltParts));
+                    rewrites++;
+                    // Give nested (non-Service) opaques a chance to
+                    // trigger shape rewrites of their own.
+                    for (TupleExpr op : opaques) {
+                        if (!(op instanceof Service)) op.visit(this);
+                    }
+                    return;
+                }
+            }
+            // No rewrite at this level. Walk into non-Service opaques
+            // to let nested BGPs try. The SPs themselves have Join
+            // parents and meet(StatementPattern) early-returns for
+            // them, preserving the "all-or-nothing per BGP" semantics
+            // (see skipsBgpWithForeignPredicate).
+            for (TupleExpr op : opaques) {
+                if (!(op instanceof Service)) op.visit(this);
+            }
+        }
+
+        @Override
+        public void meet(final Service s) {
+            // Opaque boundary &mdash; the caller's chosen source owns
+            // its body. Don't descend, don't rewrite anything inside.
         }
 
         @Override
@@ -112,20 +165,27 @@ public final class ShapeRewrite implements QueryOptimizer {
     }
 
     /**
-     * Populate {@code acc} with every {@link StatementPattern} under
-     * {@code node}, returning true only if {@code node} is a pure BGP
-     * &mdash; nested {@link Join}s of statement patterns only.
+     * Flatten a Join subtree into its list of leaf {@link TupleExpr}s
+     * &mdash; every non-Join descendant along the left/right spine. The
+     * order mirrors an in-order walk of the Join tree.
      */
-    private static boolean collectPureBgp(final TupleExpr node, final List<StatementPattern> acc) {
-        if (node instanceof StatementPattern sp) {
-            acc.add(sp);
-            return true;
-        }
+    private static void flattenJoinTree(final TupleExpr node, final List<TupleExpr> acc) {
         if (node instanceof Join j) {
-            return collectPureBgp(j.getLeftArg(), acc)
-                    && collectPureBgp(j.getRightArg(), acc);
+            flattenJoinTree(j.getLeftArg(), acc);
+            flattenJoinTree(j.getRightArg(), acc);
+        } else {
+            acc.add(node);
         }
-        return false;
+    }
+
+    /** Left-associative Join over an arbitrary list of {@link TupleExpr}. */
+    private static TupleExpr joinAllExpr(final List<TupleExpr> parts) {
+        if (parts.isEmpty()) throw new IllegalArgumentException("empty join");
+        TupleExpr acc = parts.get(0);
+        for (int i = 1; i < parts.size(); i++) {
+            acc = new Join(acc, parts.get(i));
+        }
+        return acc;
     }
 
     /**
