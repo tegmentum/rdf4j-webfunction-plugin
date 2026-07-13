@@ -337,6 +337,11 @@ public final class WfFederationRewrite implements QueryOptimizer {
             case WF_SEARCH           -> "wf-search:"   + s.name();
             case WF_FETCH            -> "wf-fetch:"    + s.name();
             case WF_DOCUMENT         -> "wf-document:" + s.name();
+            // wf_vector v0.1 — RDF4J has no native vector index; the URL
+            // stays unfolded and dispatches against the substrate URL
+            // surface. On engines without a wf-vector-capable backend
+            // registered separately this will error (wf-vector memo §10).
+            case WF_VECTOR           -> "wf-vector:"   + s.name();
         };
     }
 
@@ -365,7 +370,11 @@ public final class WfFederationRewrite implements QueryOptimizer {
     private static boolean defaultSilentFor(final SourceType type) {
         return switch (type) {
             case SPARQL, HTTP_SPARQL -> true;
-            case WF_SEARCH, WF_FETCH, WF_DOCUMENT -> false;
+            // WF_VECTOR joins the substrate-local group (wf-vector memo
+            // §09) — a KNN dispatch failure inside the embedded index
+            // (or an unfolded wf-vector: URL on an engine that has no
+            // handler) is a real bug the operator should see.
+            case WF_SEARCH, WF_FETCH, WF_DOCUMENT, WF_VECTOR -> false;
         };
     }
 

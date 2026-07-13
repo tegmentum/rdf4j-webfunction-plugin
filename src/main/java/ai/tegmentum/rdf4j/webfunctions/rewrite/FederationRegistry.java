@@ -56,6 +56,17 @@ public final class FederationRegistry {
         WF_FETCH,
         /** Substrate wf-document URL-sugar source. */
         WF_DOCUMENT,
+        /**
+         * Substrate wf-vector URL-sugar source
+         * (wf-conformance/docs/design/wf-vector.md &sect;04). RDF4J has
+         * no native vector index in v0.1; the federation pass still
+         * emits {@code SERVICE <wf-vector:<name>?...>} for entries of
+         * this type, but the URL stays unfolded and will error unless
+         * a wf-vector-capable backend is federated in some other way.
+         * See memo &sect;10 for the v0.2+ path to a native co-located
+         * index on RDF4J.
+         */
+        WF_VECTOR,
         /** External SPARQL endpoint reached over HTTP. */
         HTTP_SPARQL
     }
@@ -193,11 +204,12 @@ public final class FederationRegistry {
             case "wf-search", "wf_search"     -> SourceType.WF_SEARCH;
             case "wf-fetch", "wf_fetch"       -> SourceType.WF_FETCH;
             case "wf-document", "wf_document" -> SourceType.WF_DOCUMENT;
+            case "wf-vector", "wf_vector" -> SourceType.WF_VECTOR;
             case "http-sparql", "http_sparql" -> SourceType.HTTP_SPARQL;
             default -> throw new IllegalArgumentException(
                     "federation registry source `" + name + "`: unknown type `" + typeStr
                             + "` (expected `sparql`, `wf-search`, `wf-fetch`, `wf-document`, "
-                            + "or `http-sparql`)");
+                            + "`wf-vector`, or `http-sparql`)");
         };
         if (!raw.hasNonNull("endpoint")) {
             throw new IllegalArgumentException(
