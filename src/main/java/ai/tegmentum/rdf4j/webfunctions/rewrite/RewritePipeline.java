@@ -161,6 +161,17 @@ public final class RewritePipeline {
         if (anyWfSearchSource && invokeRegistry != null) {
             out.add(new WfSearchRewrite(documentRegistry, fulltextRegistry, invokeRegistry));
         }
+        // WfFetchRewrite runs between WfSearchRewrite and ShapeRewrite.
+        // Folds SERVICE <wf-fetch:<name>> (emitted by WfFederationRewrite
+        // for WF_FETCH-typed sources) into the same SERVICE <wf:call>
+        // envelope ShapeRewrite emits for direct-BGP shape hits. Bridge:
+        // FederationRegistry names the source, confirms WF_FETCH type;
+        // ShapeRegistry supplies the wire contract; both keyed by the
+        // same name.
+        if (shapeRegistry != null && !shapeRegistry.isEmpty()
+                && wfFetchUrl != null && !wfFetchUrl.isEmpty()) {
+            out.add(new WfFetchRewrite(federationRegistry, shapeRegistry, wfFetchUrl));
+        }
         if (shapeRegistry != null && !shapeRegistry.isEmpty()
                 && wfFetchUrl != null && !wfFetchUrl.isEmpty()) {
             out.add(new ShapeRewrite(shapeRegistry, wfFetchUrl));
