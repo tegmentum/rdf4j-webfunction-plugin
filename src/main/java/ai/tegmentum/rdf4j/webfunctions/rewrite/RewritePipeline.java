@@ -150,8 +150,16 @@ public final class RewritePipeline {
         // before the registry lookup, and the SERVICE URL sugar becomes
         // a wf-invoke:<hex> allocation before ShapeRewrite decides
         // whether to fold any surrounding BGP.
-        if (documentRegistry != null && !documentRegistry.isEmpty() && invokeRegistry != null) {
-            out.add(new WfSearchRewrite(documentRegistry, invokeRegistry));
+        // WfSearchRewrite consults BOTH DocumentRegistry (primary,
+        // wf_document guest ABI) and FulltextRegistry (fallback,
+        // wf_fulltext guest ABI). Enabled when either registry has an
+        // entry: a federation source may declare `wf-search:<name>` sugar
+        // whose dispatch info lives only in --fulltext-config.
+        final boolean anyWfSearchSource =
+                (documentRegistry != null && !documentRegistry.isEmpty())
+                        || (fulltextRegistry != null && !fulltextRegistry.isEmpty());
+        if (anyWfSearchSource && invokeRegistry != null) {
+            out.add(new WfSearchRewrite(documentRegistry, fulltextRegistry, invokeRegistry));
         }
         if (shapeRegistry != null && !shapeRegistry.isEmpty()
                 && wfFetchUrl != null && !wfFetchUrl.isEmpty()) {

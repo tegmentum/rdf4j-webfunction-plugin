@@ -16,6 +16,10 @@ import org.eclipse.rdf4j.query.algebra.evaluation.QueryOptimizer;
 import org.eclipse.rdf4j.query.algebra.helpers.AbstractQueryModelVisitor;
 import org.eclipse.rdf4j.query.algebra.helpers.collectors.StatementPatternCollector;
 
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.json.JsonMapper;
+
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -84,6 +88,7 @@ import java.util.Map;
 public final class WfSearchRewrite implements QueryOptimizer {
 
     private static final ValueFactory VF = SimpleValueFactory.getInstance();
+    private static final ObjectMapper MAPPER = JsonMapper.builder().build();
 
     /** The {@code wf-search:} URL scheme (memo §05). */
     public static final String WF_SEARCH_SCHEME = "wf-search:";
@@ -100,11 +105,28 @@ public final class WfSearchRewrite implements QueryOptimizer {
     private static final int DEFAULT_LIMIT = 10;
 
     private final DocumentRegistry registry;
+    private final FulltextRegistry fulltextRegistry;
     private final InvokeRegistry invokes;
     private int rewrites;
 
     public WfSearchRewrite(final DocumentRegistry registry, final InvokeRegistry invokes) {
+        this(registry, null, invokes);
+    }
+
+    /**
+     * Two-registry constructor. DocumentRegistry is the primary
+     * resolver (wf_document guest ABI). FulltextRegistry is consulted as
+     * a fallback so a {@code wf-search:<name>} URL whose dispatch info
+     * lives only in {@code --fulltext-config} still folds, using the
+     * wf_fulltext guest ABI:
+     * {@code [backend_endpoint, index, query, opts_json]}. Closes the
+     * {@code federation_wf_search} conformance case.
+     */
+    public WfSearchRewrite(final DocumentRegistry registry,
+                           final FulltextRegistry fulltextRegistry,
+                           final InvokeRegistry invokes) {
         this.registry = registry;
+        this.fulltextRegistry = fulltextRegistry;
         this.invokes = invokes;
     }
 
@@ -114,7 +136,10 @@ public final class WfSearchRewrite implements QueryOptimizer {
     @Override
     public void optimize(final TupleExpr tupleExpr, final Dataset dataset, final BindingSet bindings) {
         rewrites = 0;
-        if (registry == null || registry.isEmpty() || invokes == null) return;
+        if (invokes == null) return;
+        final boolean bothEmpty = (registry == null || registry.isEmpty())
+                && (fulltextRegistry == null || fulltextRegistry.isEmpty());
+        if (bothEmpty) return;
         tupleExpr.visit(new Walker());
     }
 
@@ -143,25 +168,24 @@ public final class WfSearchRewrite implements QueryOptimizer {
             final ParsedUrl parsed = parseUrl(url);
             if (parsed == null) return; // missing name — skip
 
-            final DocumentRegistry.DocumentIndex entry = registry.byName(parsed.name);
-            if (entry == null) return; // unregistered name — leave the SERVICE alone
-
             final String query = extractWfQuery(service.getServiceExpr());
             if (query == null) return; // no wf:query triple — skip
 
-            final int limit = parseLimit(parsed.opts, DEFAULT_LIMIT);
-            final String optsJson = buildOptsJson(parsed.timeSpec, parsed.opts);
-
-            final List<Value> args = new ArrayList<>(6);
-            args.add(VF.createLiteral(entry.searchBackend()));
-            args.add(VF.createLiteral(entry.storageBackend()));
-            args.add(VF.createLiteral(entry.searchIndex()));
-            args.add(VF.createLiteral(query));
-            args.add(VF.createLiteral(limit));
-            args.add(VF.createLiteral(optsJson));
-
-            final long id = invokes.insert(new InvokeSpec(entry.guestUrl(), args, "search"));
-            final String invokeIri = InvokeRegistry.iriFor(id);
+            // Primary path: DocumentRegistry (wf_document guest ABI).
+            final DocumentRegistry.DocumentIndex docEntry =
+                    registry == null ? null : registry.byName(parsed.name);
+            final String invokeIri;
+            if (docEntry != null) {
+                invokeIri = allocateDocumentInvoke(docEntry, parsed, query);
+            } else {
+                // Fallback: FulltextRegistry (wf_fulltext guest ABI).
+                // Enables federation sources whose dispatch info lives
+                // in --fulltext-config.
+                final FulltextRegistry.FulltextIndex ftEntry =
+                        fulltextRegistry == null ? null : fulltextRegistry.byName(parsed.name);
+                if (ftEntry == null) return; // unregistered — leave alone
+                invokeIri = allocateFulltextInvoke(ftEntry, parsed, query);
+            }
 
             // Swap the serviceRef Var for one bound to wf-invoke:<hex>. RDF4J
             // insists a Var not be shared across parents, so mint a fresh
@@ -176,10 +200,128 @@ public final class WfSearchRewrite implements QueryOptimizer {
             rewrites++;
         }
 
+        private String allocateDocumentInvoke(final DocumentRegistry.DocumentIndex entry,
+                                              final ParsedUrl parsed,
+                                              final String query) {
+            final int limit = parseLimit(parsed.opts, DEFAULT_LIMIT);
+            final String optsJson = buildOptsJson(parsed.timeSpec, parsed.opts);
+            final List<Value> args = new ArrayList<>(6);
+            args.add(VF.createLiteral(entry.searchBackend()));
+            args.add(VF.createLiteral(entry.storageBackend()));
+            args.add(VF.createLiteral(entry.searchIndex()));
+            args.add(VF.createLiteral(query));
+            args.add(VF.createLiteral(limit));
+            args.add(VF.createLiteral(optsJson));
+            final long id = invokes.insert(new InvokeSpec(entry.guestUrl(), args, "search"));
+            return InvokeRegistry.iriFor(id);
+        }
+
+        /**
+         * FulltextRegistry-backed fallback allocator. Emits an InvokeSpec
+         * against the wf_fulltext guest ABI:
+         * {@code [backend_endpoint, index, query, opts_json]}.
+         * {@code backend_endpoint} and {@code index} come from the
+         * entry's {@code opts_json}; sensible defaults apply when the
+         * fields are absent.
+         */
+        private String allocateFulltextInvoke(final FulltextRegistry.FulltextIndex entry,
+                                              final ParsedUrl parsed,
+                                              final String query) {
+            // wf_fulltext guest's `query-opts` WIT record has two
+            // REQUIRED fields — `fields: list<string>` and
+            // `highlight: bool`. Emit both as defaults; otherwise the
+            // substrate's typed-arg marshaller fails with
+            // "record missing required field `fields`".
+            final String optsJson = buildFulltextOptsJson(parsed.timeSpec, parsed.opts);
+            final String[] be = splitFulltextOpts(entry);
+            final List<Value> args = new ArrayList<>(4);
+            args.add(VF.createLiteral(be[0])); // backend_endpoint
+            args.add(VF.createLiteral(be[1])); // index
+            args.add(VF.createLiteral(query));
+            args.add(VF.createLiteral(optsJson));
+            final long id = invokes.insert(new InvokeSpec(entry.backendUrl(), args, "search"));
+            return InvokeRegistry.iriFor(id);
+        }
+
+        /**
+         * Build JSON matching the wf_fulltext guest's {@code query-opts}
+         * WIT record. {@code fields} and {@code highlight} are required.
+         */
+        private static String buildFulltextOptsJson(final String timeSpec,
+                                                    final Map<String, String> opts) {
+            final StringBuilder sb = new StringBuilder();
+            sb.append('{');
+            sb.append("\"fields\":[]");
+            final String hl = opts.get("highlight");
+            sb.append(",\"highlight\":")
+                    .append("true".equalsIgnoreCase(hl) || "1".equals(hl) ? "true" : "false");
+            appendOptInt(sb, opts.get("limit"), "limit");
+            appendOptInt(sb, opts.get("offset"), "offset");
+            appendOptStr(sb, opts.get("lang"), "lang");
+            appendOptStr(sb, opts.get("filter"), "filter");
+            appendOptStr(sb, opts.get("after"), "after");
+            appendOptStr(sb, opts.get("before"), "before");
+            if (timeSpec != null) {
+                if (timeSpec.startsWith("rev")) {
+                    try {
+                        sb.append(",\"at_rev\":").append(Long.parseLong(timeSpec.substring(3)));
+                    } catch (NumberFormatException ignored) {}
+                } else {
+                    sb.append(",\"at_time\":\"").append(jsonEscape(timeSpec)).append('"');
+                }
+            }
+            sb.append('}');
+            return sb.toString();
+        }
+
+        private static void appendOptInt(final StringBuilder sb, final String v, final String key) {
+            if (v == null || v.isEmpty()) return;
+            try {
+                final long n = Long.parseLong(v);
+                sb.append(",\"").append(key).append("\":").append(n);
+            } catch (NumberFormatException ignored) {}
+        }
+
+        private static void appendOptStr(final StringBuilder sb, final String v, final String key) {
+            if (v == null || v.isEmpty()) return;
+            sb.append(",\"").append(key).append("\":\"").append(jsonEscape(v)).append('"');
+        }
+
         @Override
         protected void meetNode(final QueryModelNode n) {
             n.visitChildren(this);
         }
+    }
+
+    /**
+     * Peel {@code backend_endpoint} and {@code index} from the fulltext
+     * entry's opts_json. Mirrors
+     * {@code FulltextRewrite.splitRegistryOpts}.
+     */
+    private static String[] splitFulltextOpts(final FulltextRegistry.FulltextIndex entry) {
+        String backendEndpoint = "http://localhost:9308";
+        String indexName = entry.name();
+        try {
+            final JsonNode parsed = MAPPER.readTree(entry.optsJson());
+            if (parsed != null && parsed.isObject()) {
+                final JsonNode be = parsed.get("backend_endpoint");
+                if (be != null && !be.isNull() && be.isString()) {
+                    backendEndpoint = be.asString();
+                } else {
+                    final JsonNode bu = parsed.get("backend_url");
+                    if (bu != null && !bu.isNull() && bu.isString()) {
+                        backendEndpoint = bu.asString();
+                    }
+                }
+                final JsonNode ix = parsed.get("index");
+                if (ix != null && !ix.isNull() && ix.isString()) {
+                    indexName = ix.asString();
+                }
+            }
+        } catch (RuntimeException ignored) {
+            // Malformed opts_json — fall back to defaults.
+        }
+        return new String[] {backendEndpoint, indexName};
     }
 
     // ---------------------------------------------------------------------
