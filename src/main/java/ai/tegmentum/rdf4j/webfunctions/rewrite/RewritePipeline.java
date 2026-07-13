@@ -51,6 +51,7 @@ public final class RewritePipeline {
     private final AliasMap aliasMap;
     private final FulltextRegistry fulltextRegistry;
     private final DocumentRegistry documentRegistry;
+    private final FederationRegistry federationRegistry;
     private final ShapeRegistry shapeRegistry;
     private final String wfFetchUrl;
 
@@ -67,6 +68,7 @@ public final class RewritePipeline {
         this.aliasMap           = b.aliasMap           == null ? AliasMap.empty()          : b.aliasMap;
         this.fulltextRegistry   = b.fulltextRegistry   == null ? FulltextRegistry.empty()  : b.fulltextRegistry;
         this.documentRegistry   = b.documentRegistry   == null ? DocumentRegistry.empty()  : b.documentRegistry;
+        this.federationRegistry = b.federationRegistry == null ? FederationRegistry.empty(): b.federationRegistry;
         this.shapeRegistry      = b.shapeRegistry      == null ? ShapeRegistry.empty()     : b.shapeRegistry;
         this.wfFetchUrl         = b.wfFetchUrl;
         this.aliasRewrite       = new AliasRewrite(this.aliasMap);
@@ -79,6 +81,7 @@ public final class RewritePipeline {
     public AliasMap           aliasMap()           { return aliasMap; }
     public FulltextRegistry   fulltextRegistry()   { return fulltextRegistry; }
     public DocumentRegistry   documentRegistry()   { return documentRegistry; }
+    public FederationRegistry federationRegistry() { return federationRegistry; }
     public ShapeRegistry      shapeRegistry()      { return shapeRegistry; }
     public String             wfFetchUrl()         { return wfFetchUrl; }
 
@@ -134,6 +137,14 @@ public final class RewritePipeline {
         if (fulltextRegistry != null && !fulltextRegistry.isEmpty() && invokeRegistry != null) {
             out.add(new FulltextRewrite(fulltextRegistry, invokeRegistry));
         }
+        // WfFederationRewrite runs after Alias (so aliased predicate IRIs
+        // are canonicalised before the source-selection lookup) and
+        // BEFORE WfSearchRewrite (which expands the wf-search:/wf-fetch:/
+        // wf-document: URLs the federation pass emits into wf-invoke:<hex>
+        // allocations). Design memo §04 + §11 step 2.
+        if (federationRegistry != null && !federationRegistry.isEmpty() && invokeRegistry != null) {
+            out.add(new WfFederationRewrite(federationRegistry, invokeRegistry));
+        }
         // WfSearchRewrite runs between Alias and Shape too — same
         // reasoning: aliased document-index names get canonicalised
         // before the registry lookup, and the SERVICE URL sugar becomes
@@ -161,6 +172,7 @@ public final class RewritePipeline {
                 && (aliasMap == null           || aliasMap.isEmpty())
                 && (fulltextRegistry == null   || fulltextRegistry.isEmpty())
                 && (documentRegistry == null   || documentRegistry.isEmpty())
+                && (federationRegistry == null || federationRegistry.isEmpty())
                 && (shapeRegistry == null      || shapeRegistry.isEmpty());
     }
 
@@ -170,6 +182,7 @@ public final class RewritePipeline {
         private AliasMap aliasMap;
         private FulltextRegistry fulltextRegistry;
         private DocumentRegistry documentRegistry;
+        private FederationRegistry federationRegistry;
         private ShapeRegistry shapeRegistry;
         private String wfFetchUrl;
 
@@ -178,6 +191,7 @@ public final class RewritePipeline {
         public Builder aliasMap(final AliasMap m)                     { this.aliasMap = m; return this; }
         public Builder fulltextRegistry(final FulltextRegistry r)     { this.fulltextRegistry = r; return this; }
         public Builder documentRegistry(final DocumentRegistry r)     { this.documentRegistry = r; return this; }
+        public Builder federationRegistry(final FederationRegistry r) { this.federationRegistry = r; return this; }
         public Builder shapeRegistry(final ShapeRegistry r)           { this.shapeRegistry = r; return this; }
         public Builder wfFetchUrl(final String url)                   { this.wfFetchUrl = url; return this; }
 

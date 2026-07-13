@@ -6,6 +6,7 @@ import ai.tegmentum.rdf4j.webfunctions.rewrite.AliasMap;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.AliasRewriteState;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.ConversionRegistry;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.DocumentRegistry;
+import ai.tegmentum.rdf4j.webfunctions.rewrite.FederationRegistry;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.FulltextRegistry;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.RewritePipeline;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.ShapeEntry;
@@ -128,7 +129,25 @@ public final class ConformanceMain {
                     + " document(s) from " + parsed.documentConfig);
         }
 
-        final RewritePipeline pipeline = loadPipeline(parsed, documentRegistry, err);
+        // Federation registry powers the wf_federation rewrite pass:
+        // static-mode source selection over heterogeneous backends
+        // (SPARQL / wf-search / wf-fetch / wf-document / http-sparql).
+        // Absent flag → empty registry → pass is a no-op.
+        final FederationRegistry federationRegistry;
+        try {
+            federationRegistry = parsed.federationConfig == null
+                    ? FederationRegistry.empty()
+                    : FederationRegistry.loadFromJson(parsed.federationConfig);
+        } catch (Exception e) {
+            err.println("federation config error: " + e.getMessage());
+            return 2;
+        }
+        if (parsed.federationConfig != null) {
+            err.println("loaded " + federationRegistry.size()
+                    + " federation source(s) from " + parsed.federationConfig);
+        }
+
+        final RewritePipeline pipeline = loadPipeline(parsed, documentRegistry, federationRegistry, err);
         if (pipeline == null) return 2;
 
         final MemoryStore store = new MemoryStore();
@@ -186,6 +205,7 @@ public final class ConformanceMain {
         Path partialConfig;
         Path fulltextConfig;
         Path documentConfig;
+        Path federationConfig;
     }
 
     static Args parseArgs(final String[] argv, final PrintStream err) {
@@ -206,6 +226,7 @@ public final class ConformanceMain {
                 case "--partial-config"    -> a.partialConfig = Path.of(value);
                 case "--fulltext-config"   -> a.fulltextConfig = Path.of(value);
                 case "--document-config"   -> a.documentConfig = Path.of(value);
+                case "--federation-config" -> a.federationConfig = Path.of(value);
                 default -> {
                     err.println("unknown argument: " + flag);
                     return null;
@@ -225,13 +246,15 @@ public final class ConformanceMain {
 
     // ---- config loading ---------------------------------------------------
 
-    static RewritePipeline loadPipeline(final Args a, final DocumentRegistry documentRegistry, final PrintStream err) {
+    static RewritePipeline loadPipeline(final Args a, final DocumentRegistry documentRegistry,
+                                        final FederationRegistry federationRegistry, final PrintStream err) {
         try {
             final RewritePipeline.Builder b = RewritePipeline.builder();
             if (a.aliasConfig      != null) b.aliasMap(loadAliasMap(a.aliasConfig));
             if (a.conversionConfig != null) b.conversionRegistry(loadConversionRegistry(a.conversionConfig));
             if (a.shapeConfig      != null) b.shapeRegistry(loadShapeRegistry(a.shapeConfig));
             if (documentRegistry   != null && !documentRegistry.isEmpty()) b.documentRegistry(documentRegistry);
+            if (federationRegistry != null && !federationRegistry.isEmpty()) b.federationRegistry(federationRegistry);
             if (a.partialConfig    != null) {
                 final JsonNode root = MAPPER.readTree(Files.readString(a.partialConfig));
                 if (root.hasNonNull("wf_fetch_url")) {
