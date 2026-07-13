@@ -148,7 +148,7 @@ public final class ConformanceMain {
                     + " federation source(s) from " + parsed.federationConfig);
         }
 
-        final RewritePipeline pipeline = loadPipeline(parsed, documentRegistry, federationRegistry, err);
+        final RewritePipeline pipeline = loadPipeline(parsed, fulltextRegistry, documentRegistry, federationRegistry, err);
         if (pipeline == null) return 2;
 
         final MemoryStore store = new MemoryStore();
@@ -259,13 +259,15 @@ public final class ConformanceMain {
 
     // ---- config loading ---------------------------------------------------
 
-    static RewritePipeline loadPipeline(final Args a, final DocumentRegistry documentRegistry,
+    static RewritePipeline loadPipeline(final Args a, final FulltextRegistry fulltextRegistry,
+                                        final DocumentRegistry documentRegistry,
                                         final FederationRegistry federationRegistry, final PrintStream err) {
         try {
             final RewritePipeline.Builder b = RewritePipeline.builder();
             if (a.aliasConfig      != null) b.aliasMap(loadAliasMap(a.aliasConfig));
             if (a.conversionConfig != null) b.conversionRegistry(loadConversionRegistry(a.conversionConfig));
             if (a.shapeConfig      != null) b.shapeRegistry(loadShapeRegistry(a.shapeConfig));
+            if (fulltextRegistry   != null && !fulltextRegistry.isEmpty()) b.fulltextRegistry(fulltextRegistry);
             if (documentRegistry   != null && !documentRegistry.isEmpty()) b.documentRegistry(documentRegistry);
             if (federationRegistry != null && !federationRegistry.isEmpty()) b.federationRegistry(federationRegistry);
             if (a.partialConfig    != null) {
