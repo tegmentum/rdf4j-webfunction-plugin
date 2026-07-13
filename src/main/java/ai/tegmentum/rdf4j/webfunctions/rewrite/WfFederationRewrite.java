@@ -321,7 +321,7 @@ public final class WfFederationRewrite implements QueryOptimizer {
                 VF.createIRI(url),
                 true,
                 true);
-        return new Service(serviceRef, body, "", new HashMap<>(), "", false);
+        return new Service(serviceRef, body, "", new HashMap<>(), "", resolveSilent(source));
     }
 
     private static String urlFor(final FederationSource s) {
@@ -330,6 +330,35 @@ public final class WfFederationRewrite implements QueryOptimizer {
             case WF_SEARCH           -> "wf-search:"   + s.name();
             case WF_FETCH            -> "wf-fetch:"    + s.name();
             case WF_DOCUMENT         -> "wf-document:" + s.name();
+        };
+    }
+
+    /**
+     * Resolve the {@code SERVICE SILENT} flag for {@code source} per
+     * memo &sect;08. Explicit {@code silent} on the registry entry
+     * wins; otherwise fall back to the per-source-type default:
+     *
+     * <ul>
+     *   <li>{@code SPARQL} / {@code HTTP_SPARQL} &rarr; {@code true}
+     *       (network endpoint; transport errors degrade to empty
+     *       bindings rather than fail the whole query, honest since
+     *       static-mode has no probing).</li>
+     *   <li>{@code WF_SEARCH} / {@code WF_FETCH} / {@code WF_DOCUMENT}
+     *       &rarr; {@code false} (substrate-local dispatch; a failure
+     *       is a real bug the operator should see, not a network flap
+     *       to mask).</li>
+     * </ul>
+     *
+     * Package-private for the tests.
+     */
+    static boolean resolveSilent(final FederationSource source) {
+        return source.silent().orElseGet(() -> defaultSilentFor(source.sourceType()));
+    }
+
+    private static boolean defaultSilentFor(final SourceType type) {
+        return switch (type) {
+            case SPARQL, HTTP_SPARQL -> true;
+            case WF_SEARCH, WF_FETCH, WF_DOCUMENT -> false;
         };
     }
 
