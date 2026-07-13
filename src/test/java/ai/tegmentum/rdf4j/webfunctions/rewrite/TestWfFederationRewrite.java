@@ -516,6 +516,72 @@ public class TestWfFederationRewrite {
                 .isTrue();
     }
 
+    // ---------------------------------------------------------------------
+     // serviceExpressionString — the on-wire SPARQL body
+     //
+     // RDF4J's `SPARQLFederatedService` reads the raw expression STRING
+     // (not the algebra tree) when it renders the query it POSTs to the
+     // remote endpoint (see `Service.initPreparedQueryString`). Emitting
+     // "" here ships `SELECT ... WHERE {}` and every source returns
+     // zero rows — the whole federation-empty-bindings symptom. These
+     // tests keep the renderer honest and lock the regression down.
+     // ---------------------------------------------------------------------
+
+    /** BGP body populated on the Service.serviceExpressionString. */
+    @Test
+    public void serviceExpressionStringCarriesBgpBody() {
+        final FederationRegistry reg = FederationRegistry.of(List.of(
+                sparql("prod", "http://prod/query",
+                        "http://ex/sku", "http://ex/price")));
+        final InvokeRegistry inv = new InvokeRegistry();
+        final ParsedQuery pq = parse(
+                "SELECT ?s ?sku ?price WHERE {\n"
+                        + "  ?s <http://ex/sku> ?sku .\n"
+                        + "  ?s <http://ex/price> ?price .\n"
+                        + "}");
+        final WfFederationRewrite rw = new WfFederationRewrite(reg, inv);
+        rw.rewritePattern(pq.getTupleExpr());
+
+        final Service svc = serviceForUrl(pq.getTupleExpr(), "http://prod/query");
+        assertThat(svc).isNotNull();
+        final String body = svc.getServiceExpressionString();
+        assertThat(body)
+                .as("SERVICE body must be a non-empty SPARQL BGP so"
+                        + " SPARQLFederatedService ships the pushed-down triples")
+                .isNotEmpty()
+                .contains("?s")
+                .contains("<http://ex/sku>")
+                .contains("<http://ex/price>");
+    }
+
+    /** Pushed-down FILTER survives to the wire, not just to the algebra. */
+    @Test
+    public void serviceExpressionStringIncludesPushedFilter() {
+        final FederationRegistry reg = FederationRegistry.of(List.of(
+                sparql("prod", "http://prod/query",
+                        "http://ex/label", "http://ex/price")));
+        final InvokeRegistry inv = new InvokeRegistry();
+        final ParsedQuery pq = parse(
+                "SELECT ?p ?l WHERE {\n"
+                        + "  ?p <http://ex/label> ?l .\n"
+                        + "  ?p <http://ex/price> ?price .\n"
+                        + "  FILTER(?price < 50)\n"
+                        + "}");
+        final WfFederationRewrite rw = new WfFederationRewrite(reg, inv);
+        rw.rewritePattern(pq.getTupleExpr());
+
+        final Service svc = serviceForUrl(pq.getTupleExpr(), "http://prod/query");
+        assertThat(svc).isNotNull();
+        final String body = svc.getServiceExpressionString();
+        // Filter pushdown must land in the shipped SPARQL, else the
+        // remote receives a bare BGP and ships back every row.
+        assertThat(body)
+                .as("pushed-down FILTER must land in the on-wire body")
+                .contains("FILTER")
+                .contains("?price")
+                .contains("50");
+    }
+
     /**
      * Omitted {@code silent} on a wf-search source falls back to the
      * type-based default (false — substrate-local dispatch; failures

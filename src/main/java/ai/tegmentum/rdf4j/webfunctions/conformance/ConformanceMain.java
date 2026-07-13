@@ -17,6 +17,7 @@ import org.eclipse.rdf4j.query.TupleQueryResult;
 import org.eclipse.rdf4j.query.resultio.sparqljson.SPARQLResultsJSONWriter;
 import org.eclipse.rdf4j.repository.RepositoryConnection;
 import org.eclipse.rdf4j.repository.sail.SailRepository;
+import org.eclipse.rdf4j.repository.sparql.federation.SPARQLServiceResolver;
 import org.eclipse.rdf4j.rio.RDFFormat;
 import org.eclipse.rdf4j.sail.memory.MemoryStore;
 
@@ -154,16 +155,28 @@ public final class ConformanceMain {
         // Install the pipeline before init() so the first strategy handed
         // out by createEvaluationStrategy() picks it up.
         //
-        // The federated-service resolver is a WfServiceResolver with no
-        // delegate (the runner has no HTTP SPARQL federation to fall back
-        // to) and the pipeline's InvokeRegistry so wf-invoke:<hex> SERVICE
-        // refs — planted by PartialRewrite when it constant-folds
-        // wf:partial(...) — dispatch through WfInvokeService. A non-null
-        // resolver is also required to sidestep an RDF4J NPE inside
-        // ServiceQueryEvaluationStep.evaluate whenever any SERVICE clause
-        // reaches evaluation (which the ShapeRewrite pass always installs).
+        // The federated-service resolver is a WfServiceResolver in front
+        // of a real {@link SPARQLServiceResolver} so:
+        //   * wf-invoke:<hex> SERVICE refs — planted by PartialRewrite
+        //     when it constant-folds wf:partial(...) — dispatch through
+        //     WfInvokeService.
+        //   * SERVICE clauses pointing at wasm URLs (file:/ipfs:, or
+        //     http(s):// with a `.wasm` suffix) dispatch through
+        //     WfCallService.
+        //   * SERVICE clauses pointing at ordinary HTTP SPARQL endpoints
+        //     — the ones the wf_federation rewrite emits for `type =
+        //     "sparql"` sources — fall through to the SPARQL client and
+        //     actually issue an HTTP POST. Without a real delegate, the
+        //     resolver would either reject the URL outright or (with the
+        //     pre-fix wasm-URL matcher) mis-classify it as wasm; either
+        //     way SILENT would swallow the failure and federation would
+        //     return `[]` with zero visible cause.
+        // A non-null resolver is also required to sidestep an RDF4J NPE
+        // inside ServiceQueryEvaluationStep.evaluate whenever any SERVICE
+        // clause reaches evaluation (which the ShapeRewrite pass always
+        // installs).
         final WfServiceResolver resolver =
-                new WfServiceResolver(null, pipeline.invokeRegistry());
+                new WfServiceResolver(new SPARQLServiceResolver(), pipeline.invokeRegistry());
         store.setEvaluationStrategyFactory(new WfEvaluationStrategyFactory(resolver, store, pipeline));
 
         final SailRepository repo = new SailRepository(store);

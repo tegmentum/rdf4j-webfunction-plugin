@@ -321,7 +321,14 @@ public final class WfFederationRewrite implements QueryOptimizer {
                 VF.createIRI(url),
                 true,
                 true);
-        return new Service(serviceRef, body, "", new HashMap<>(), "", resolveSilent(source));
+        // Render the body as SPARQL text and hand it to the Service
+        // constructor. RDF4J's SPARQLFederatedService uses the raw
+        // string (via getSelectQueryString()), NOT the algebra tree, to
+        // build the SPARQL that flies over the wire. Passing "" here
+        // ships `SELECT ... WHERE {}` and every remote returns zero
+        // rows — the whole federation-empty-bindings bug.
+        return new Service(serviceRef, body, BgpSparqlRenderer.render(body),
+                new HashMap<>(), "", resolveSilent(source));
     }
 
     private static String urlFor(final FederationSource s) {
@@ -415,6 +422,12 @@ public final class WfFederationRewrite implements QueryOptimizer {
             final TupleExpr body = target.getServiceExpr();
             final Filter inner = new Filter(body, f.getCondition().clone());
             target.setArg(inner);
+            // Re-render the serviceExpressionString now that the body
+            // grew a filter. RDF4J's SPARQLFederatedService reads that
+            // raw string, not the algebra, when it renders the SPARQL
+            // it POSTs to the remote — a stale string would ship the
+            // pre-pushdown BGP and hide the filter from the source.
+            target.setExpressionString(BgpSparqlRenderer.render(inner));
             f.replaceWith(f.getArg());
         }
 

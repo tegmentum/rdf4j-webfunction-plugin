@@ -147,13 +147,47 @@ public final class WfCallService implements FederatedService {
 
     // ---- URL matching helper -----------------------------------------------
 
+    /**
+     * Does {@code uri} look like a URL pointing at a WASM component the
+     * {@link WfCallService} handler should own?
+     *
+     * <p>{@code file:} and {@code ipfs:} URLs are almost always wasm
+     * component drops (nobody types {@code SERVICE <file:///...>} at a
+     * SPARQL endpoint), so they match unconditionally. For {@code http:}
+     * and {@code https:} URLs — which the wf_federation rewrite also
+     * emits, but pointing at real SPARQL endpoints, not wasm bytes —
+     * require an explicit {@code .wasm} suffix (with optional query
+     * string / fragment). Anything else is delegated to the fallback
+     * SPARQL federated-service resolver.
+     *
+     * <p>Without this discrimination, wf_federation's emitted
+     * {@code SERVICE <http://.../query>} clauses get treated as wasm
+     * URLs, the component loader does a GET, gets non-wasm bytes back,
+     * and SILENT semantics swallow the failure — federation returns
+     * empty bindings with zero visible cause.
+     */
     static boolean matchesWasmUrl(final String uri) {
         if (uri == null) return false;
         final String lower = uri.toLowerCase();
-        return lower.startsWith("file:")
-                || lower.startsWith("http:")
-                || lower.startsWith("https:")
-                || lower.startsWith("ipfs:");
+        if (lower.startsWith("file:") || lower.startsWith("ipfs:")) return true;
+        if (lower.startsWith("http:") || lower.startsWith("https:")) {
+            // Trim query string / fragment before checking the suffix so
+            // `http://cdn/mod.wasm?v=1` and `http://cdn/mod.wasm#sig`
+            // still match. `.component.wasm` naturally falls out of the
+            // `.wasm` check.
+            final int q = indexOfAny(lower, '?', '#');
+            final String path = q < 0 ? lower : lower.substring(0, q);
+            return path.endsWith(".wasm");
+        }
+        return false;
+    }
+
+    private static int indexOfAny(final String s, final char a, final char b) {
+        final int ia = s.indexOf(a);
+        final int ib = s.indexOf(b);
+        if (ia < 0) return ib;
+        if (ib < 0) return ia;
+        return Math.min(ia, ib);
     }
 
     static URL parseUrl(final String uri) throws MalformedURLException {
