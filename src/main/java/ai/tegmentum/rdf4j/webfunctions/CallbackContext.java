@@ -47,6 +47,12 @@ public final class CallbackContext {
     private final java.util.Map<Integer, Prepared> prepared = new java.util.HashMap<>();
     private int nextHandle = 1;
 
+    // v0.5 open sink handles. Vec-backed (not a HashMap) because the index
+    // IS the handle; null slots survive sink-close calls without shifting.
+    // Guests get a fresh table per bind() and the outer wf:call frame is
+    // responsible for closing whatever the guest didn't via sink-close.
+    private final java.util.List<Sink> sinks = new java.util.ArrayList<>();
+
     /**
      * A precompiled sub-query bound to this context's strategy. Holds the
      * {@link QueryEvaluationStep} so runPrepared() only pays initial-binding
@@ -100,8 +106,23 @@ public final class CallbackContext {
      * Clear the thread's binding. Callers must pair each successful bind
      * with an unbind — typically in a try/finally at the outermost strategy
      * evaluation boundary. Safe to call when no context is bound.
+     *
+     * <p>Also closes any v0.5 sink handles the guest didn't explicitly
+     * release via {@code sink-close}. Matches the WIT contract:
+     * <em>"Handles are valid only within the outer wf:call frame that
+     * opened them — the host closes them automatically when that frame
+     * returns."</em>
      */
     public static void unbind() {
+        final CallbackContext ctx = CURRENT.get();
+        if (ctx != null) {
+            for (Sink s : ctx.sinks) {
+                if (s != null) {
+                    try { s.close(); } catch (RuntimeException ignored) {}
+                }
+            }
+            ctx.sinks.clear();
+        }
         CURRENT.remove();
     }
 
@@ -170,6 +191,90 @@ public final class CallbackContext {
     }
 
     /**
+     * v0.6 execute-query-with-bindings: execute a SPARQL SELECT with a full
+     * pre-seed binding matrix (vars + rows) rather than a single row of
+     * scalar bindings. Semantics mirror Oxigraph's
+     * {@code run_query_with_seed} — the seed is spliced under the outermost
+     * projection as a VALUES join via a
+     * {@link org.eclipse.rdf4j.query.algebra.BindingSetAssignment} node.
+     *
+     * <p>Missing cells in a row become RDF4J UNDEF (the binding is simply
+     * absent from the row's {@link BindingSet}), matching SPARQL 1.1
+     * VALUES semantics.
+     */
+    public CloseableIteration<BindingSet> executeSelectWithBindings(
+            final String sparql,
+            final java.util.List<String> seedVars,
+            final java.util.List<BindingSet> seedRows) {
+        try {
+            final ParsedTupleQuery parsed = QueryParserUtil.parseTupleQuery(
+                    QueryLanguage.SPARQL, sparql, null);
+            TupleExpr expr = parsed.getTupleExpr();
+            if (!seedVars.isEmpty() && !seedRows.isEmpty()) {
+                final org.eclipse.rdf4j.query.algebra.BindingSetAssignment bsa =
+                        new org.eclipse.rdf4j.query.algebra.BindingSetAssignment();
+                bsa.setBindingNames(new java.util.LinkedHashSet<>(seedVars));
+                bsa.setBindingSets(seedRows);
+                expr = spliceValuesUnderProjection(expr, bsa);
+            }
+            final QueryEvaluationStep step = strategy.precompile(
+                    expr, new QueryEvaluationContext.Minimal(parsed.getDataset()));
+            return step.evaluate(new org.eclipse.rdf4j.query.impl.EmptyBindingSet());
+        } catch (MalformedQueryException e) {
+            throw new RuntimeException("wf callback: SPARQL parse error: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Walk down through Projection/Distinct/Reduced/Order/Slice/Group/
+     * Filter/Extension wrappers until we reach the actual scan/join
+     * pattern, then wrap it in {@code Join(values, inner)}. Same splice
+     * path Oxigraph uses so seed columns compose with WHERE-only variables,
+     * not just the outer SELECT's projection.
+     */
+    private static TupleExpr spliceValuesUnderProjection(
+            final TupleExpr expr,
+            final org.eclipse.rdf4j.query.algebra.BindingSetAssignment values) {
+        if (expr instanceof org.eclipse.rdf4j.query.algebra.QueryRoot qr) {
+            qr.setArg(spliceValuesUnderProjection(qr.getArg(), values));
+            return qr;
+        }
+        if (expr instanceof org.eclipse.rdf4j.query.algebra.Projection p) {
+            p.setArg(spliceValuesUnderProjection(p.getArg(), values));
+            return p;
+        }
+        if (expr instanceof org.eclipse.rdf4j.query.algebra.Distinct d) {
+            d.setArg(spliceValuesUnderProjection(d.getArg(), values));
+            return d;
+        }
+        if (expr instanceof org.eclipse.rdf4j.query.algebra.Reduced r) {
+            r.setArg(spliceValuesUnderProjection(r.getArg(), values));
+            return r;
+        }
+        if (expr instanceof org.eclipse.rdf4j.query.algebra.Order o) {
+            o.setArg(spliceValuesUnderProjection(o.getArg(), values));
+            return o;
+        }
+        if (expr instanceof org.eclipse.rdf4j.query.algebra.Slice s) {
+            s.setArg(spliceValuesUnderProjection(s.getArg(), values));
+            return s;
+        }
+        if (expr instanceof org.eclipse.rdf4j.query.algebra.Group g) {
+            g.setArg(spliceValuesUnderProjection(g.getArg(), values));
+            return g;
+        }
+        if (expr instanceof org.eclipse.rdf4j.query.algebra.Filter f) {
+            f.setArg(spliceValuesUnderProjection(f.getArg(), values));
+            return f;
+        }
+        if (expr instanceof org.eclipse.rdf4j.query.algebra.Extension e) {
+            e.setArg(spliceValuesUnderProjection(e.getArg(), values));
+            return e;
+        }
+        return new org.eclipse.rdf4j.query.algebra.Join(values, expr);
+    }
+
+    /**
      * v0.3.2 prepare-query — parse and precompile a SPARQL SELECT once so
      * subsequent runPrepared() calls only pay initial-binding substitution
      * and iteration. Returns a small integer handle usable until this
@@ -229,6 +334,55 @@ public final class CallbackContext {
             throw new RuntimeException("wf callback: unknown prepared handle " + handle);
         }
         return p.step.evaluate(initialBindings);
+    }
+
+    // ---- v0.5 sink handles ------------------------------------------------
+
+    /**
+     * Register an opened {@link Sink} with this context and return the
+     * u32 handle the guest will use for subsequent sink-execute /
+     * sink-close calls. Handle == slot index in the internal Vec.
+     */
+    public int registerSink(final Sink sink) {
+        final int handle = sinks.size();
+        sinks.add(sink);
+        return handle;
+    }
+
+    /**
+     * Look up an open sink by handle. Returns null if the handle is out
+     * of range or has been released via {@link #closeSink(int)}.
+     */
+    public Sink getSink(final int handle) {
+        if (handle < 0 || handle >= sinks.size()) return null;
+        return sinks.get(handle);
+    }
+
+    /**
+     * Close the sink at the given handle. Returns true if the handle was
+     * live and got closed, false if it was already closed or stale — the
+     * caller shapes this into the WIT {@code result<_, string>}.
+     */
+    public boolean closeSink(final int handle) {
+        if (handle < 0 || handle >= sinks.size()) return false;
+        final Sink s = sinks.get(handle);
+        if (s == null) return false;
+        try { s.close(); } catch (RuntimeException ignored) {}
+        sinks.set(handle, null);
+        return true;
+    }
+
+    /**
+     * v0.5 execute-update — SPARQL 1.1 UPDATE against the outer
+     * {@link org.eclipse.rdf4j.sail.Sail}, no initial bindings. The v0.5
+     * WIT signature dropped the {@code bindings} arg in favor of a
+     * simpler {@code (update: string) -> result<_, string>} shape;
+     * delegates to the pre-existing {@link #executeUpdate(String,
+     * org.eclipse.rdf4j.query.BindingSet)} with an empty binding set.
+     */
+    public void executeUpdate(final String sparql) {
+        executeUpdate(sparql,
+                new org.eclipse.rdf4j.query.impl.MapBindingSet());
     }
 
     /**

@@ -43,6 +43,74 @@ public final class HostCallbacks {
 
     private HostCallbacks() {}
 
+    /**
+     * v0.6 {@code execute-query-with-bindings: func(query: string,
+     *  seed: binding-sets, max-rows: option<u32>) -> result<binding-sets, string>}.
+     *
+     * <p>Accepts a full {@code binding-sets} record (vars + rows) and
+     * splices it under the query's outermost projection as a VALUES join
+     * (a {@link org.eclipse.rdf4j.query.algebra.BindingSetAssignment} node).
+     * Mirrors Oxigraph's {@code run_query_with_seed}: gives wf_pipeline v3's
+     * typed binding-set propagation a substrate-native path that doesn't
+     * route through VALUES-text interpolation.
+     *
+     * <p>Missing cells become RDF4J UNDEF (the binding simply doesn't
+     * appear in the row's {@link BindingSet}).
+     */
+    public static WitHostFunction executeQueryWithBindings() {
+        return args -> {
+            if (!WebFunctionConfig.callbackEnabled()) {
+                return new Object[] { ComponentVal.err(ComponentVal.string(
+                    "wf callback disabled by webfunctions.callback.enabled=false")) };
+            }
+            final CallbackContext ctx = CallbackContext.current();
+            if (ctx == null) {
+                return new Object[] { ComponentVal.err(ComponentVal.string(
+                    "wf callback: no strategy bound — install WfEvaluationStrategyFactory "
+                    + "on the sail to enable callbacks")) };
+            }
+            try {
+                final String sparql = ((ComponentVal) args[0]).asString();
+                final ComponentVal seedVal = (ComponentVal) args[1];
+                final Map<String, ComponentVal> seedFields = seedVal.asRecord();
+                final ComponentVal varsField = seedFields.get("vars");
+                final ComponentVal rowsField = seedFields.get("rows");
+                if (varsField == null || rowsField == null) {
+                    return new Object[] { ComponentVal.err(ComponentVal.string(
+                        "wf execute-query-with-bindings: seed missing vars/rows field")) };
+                }
+                final List<String> seedVars = new ArrayList<>();
+                for (ComponentVal v : varsField.asList()) {
+                    seedVars.add(v.asString());
+                }
+                final ValueFactory vf = ctx.valueFactory();
+                final List<BindingSet> seedRows = new ArrayList<>();
+                for (ComponentVal rowVal : rowsField.asList()) {
+                    final org.eclipse.rdf4j.query.impl.MapBindingSet mbs =
+                            new org.eclipse.rdf4j.query.impl.MapBindingSet();
+                    for (ComponentVal bindingVal : rowVal.asList()) {
+                        final Map<String, ComponentVal> bf = bindingVal.asRecord();
+                        final String name = bf.get("name").asString();
+                        mbs.addBinding(name, decodeValue(bf.get("value"), vf));
+                    }
+                    seedRows.add(mbs);
+                }
+                final int rowCap = decodeOptionalU32((ComponentVal) args[2]).orElseGet(ctx::maxRows);
+
+                ctx.enter();
+                try (CloseableIteration<BindingSet> iter =
+                        ctx.executeSelectWithBindings(sparql, seedVars, seedRows)) {
+                    return new Object[] { ComponentVal.ok(encodeBindingSets(iter, rowCap)) };
+                } finally {
+                    ctx.exit();
+                }
+            } catch (RuntimeException e) {
+                return new Object[] { ComponentVal.err(ComponentVal.string(
+                    e.getMessage() == null ? e.toString() : e.getMessage())) };
+            }
+        };
+    }
+
     /** {@code execute-query: func(sparql: string, bindings: list<binding>,
      *  max-rows: option<u32>) -> result<binding-sets, string>}. */
     public static WitHostFunction executeQuery() {
