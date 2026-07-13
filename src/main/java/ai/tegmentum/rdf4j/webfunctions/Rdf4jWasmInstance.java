@@ -272,9 +272,282 @@ public final class Rdf4jWasmInstance implements Closeable {
                                                     final ValueFactory vf,
                                                     final Value... args) throws IOException {
         final String entry = resolveEntryPoint(entryPointOverride);
-        final WitValue result = (WitValue) instance.invokeWit(
-                entry, WitValueMarshaller.toWitArgs(args));
+        // Marshal callsite args to whatever the export actually wants.
+        // Legacy `evaluate(list<value>)` guests still take a single packed
+        // WitList; multi-param guests like wf_fulltext's
+        // `search(backend-url: string, index: string, query: string,
+        // opts: query-opts)` need N typed positional values coerced from
+        // the callsite Value[] per the introspected WIT signature. See
+        // {@code marshalTypedArgs} for the coercion policy.
+        final Object[] callArgs = marshalTypedArgs(entry, args);
+        final WitValue result = (WitValue) instance.invokeWit(entry, callArgs);
         return WitValueMarshaller.bindingSetsFromWit(unwrapOk(result), vf);
+    }
+
+    /**
+     * Look up the resolved entry-point's WIT signature via the wasmtime4j
+     * component-type introspection API and marshal the callsite Values to
+     * whatever positional shape the guest actually declared.
+     *
+     * <p>Two shapes are recognised:
+     *
+     * <ol>
+     *   <li>The historical {@code evaluate(list<value>)} — one parameter
+     *       whose type is a list. The Values are packed into a single
+     *       {@link ai.tegmentum.wasmtime4j.wit.WitList} and returned as
+     *       a length-1 {@code Object[]}, matching the current call
+     *       convention.</li>
+     *   <li>N typed positional parameters (wf_fulltext's {@code search}
+     *       is the motivating case). Each Value's lexical form is
+     *       extracted and coerced to the target WIT primitive;
+     *       record / option / list targets parse the lexical form as
+     *       JSON.</li>
+     * </ol>
+     *
+     * <p>Best-effort: when the provider doesn't expose typed export
+     * items, we fall through to the packed shape. Guests that need
+     * multi-arg dispatch use the wasmtime4j provider today, which does
+     * expose typed items via {@code JniComponentImpl.componentType}.
+     * Mirrors {@code JenaWasmInstance.marshalTypedArgs} in the sibling
+     * plugin.
+     */
+    private Object[] marshalTypedArgs(final String entry, final Value[] args) throws IOException {
+        final java.util.Optional<ai.tegmentum.wasmtime4j.component.ComponentItemInfo.ComponentFuncInfo> info =
+                lookupFuncInfo(entry);
+        if (!info.isPresent()) {
+            return new Object[] { WitValueMarshaller.toWitArgs(args) };
+        }
+        final List<ai.tegmentum.wasmtime4j.component.ComponentItemInfo.NamedType> params =
+                info.get().params();
+        // Historical `list<value>` shape: one param, list-typed.
+        if (params.size() == 1
+                && params.get(0).type().getType()
+                        == ai.tegmentum.wasmtime4j.component.ComponentType.LIST) {
+            return new Object[] { WitValueMarshaller.toWitArgs(args) };
+        }
+        if (params.size() != args.length) {
+            throw new IOException("arg count mismatch for `" + entry + "`: guest expects "
+                    + params.size() + " positional params, callsite supplied " + args.length);
+        }
+        final Object[] out = new Object[params.size()];
+        for (int i = 0; i < params.size(); i++) {
+            try {
+                out[i] = coerceValueToWit(args[i], params.get(i).type());
+            } catch (RuntimeException e) {
+                throw new IOException("arg " + i + " of `" + entry + "`: " + e.getMessage(), e);
+            }
+        }
+        return out;
+    }
+
+    private java.util.Optional<ai.tegmentum.wasmtime4j.component.ComponentItemInfo.ComponentFuncInfo>
+            lookupFuncInfo(final String exportName) {
+        final java.util.Optional<ai.tegmentum.wasmtime4j.component.ComponentInstance> nativeInstance =
+                instance.unwrap(ai.tegmentum.wasmtime4j.component.ComponentInstance.class);
+        if (!nativeInstance.isPresent()) return java.util.Optional.empty();
+        try {
+            final ai.tegmentum.wasmtime4j.component.ComponentTypeInfo typeInfo =
+                    nativeInstance.get().getComponent().componentType();
+            final java.util.Optional<ai.tegmentum.wasmtime4j.component.ComponentItemInfo> item =
+                    typeInfo.getExportItem(exportName);
+            if (!item.isPresent()) return java.util.Optional.empty();
+            if (item.get() instanceof ai.tegmentum.wasmtime4j.component.ComponentItemInfo.ComponentFuncInfo funcInfo) {
+                return java.util.Optional.of(funcInfo);
+            }
+            return java.util.Optional.empty();
+        } catch (ai.tegmentum.wasmtime4j.exception.WasmException e) {
+            return java.util.Optional.empty();
+        }
+    }
+
+    private static Object coerceValueToWit(
+            final Value value,
+            final ai.tegmentum.wasmtime4j.component.ComponentTypeDescriptor target) {
+        final String lex = lexicalOf(value);
+        return coerceLexicalToWit(lex, target);
+    }
+
+    private static String lexicalOf(final Value value) {
+        if (value.isIRI()) return value.stringValue();
+        if (value.isBNode()) return value.stringValue();
+        if (value.isLiteral()) return ((org.eclipse.rdf4j.model.Literal) value).getLabel();
+        throw new IllegalArgumentException("unsupported Value kind for typed-arg marshalling: " + value);
+    }
+
+    private static Object coerceLexicalToWit(
+            final String lex,
+            final ai.tegmentum.wasmtime4j.component.ComponentTypeDescriptor target) {
+        final ai.tegmentum.wasmtime4j.component.ComponentType kind = target.getType();
+        switch (kind) {
+            case STRING:
+                return witStringUnchecked(lex);
+            case BOOL:
+                return ai.tegmentum.wasmtime4j.wit.WitBool.of(Boolean.parseBoolean(lex));
+            case S8:  return ai.tegmentum.wasmtime4j.wit.WitS8.of(Byte.parseByte(lex));
+            case U8:  return ai.tegmentum.wasmtime4j.wit.WitU8.of(Byte.parseByte(lex));
+            case S16: return ai.tegmentum.wasmtime4j.wit.WitS16.of(Short.parseShort(lex));
+            case U16: return ai.tegmentum.wasmtime4j.wit.WitU16.of(Short.parseShort(lex));
+            case S32: return ai.tegmentum.wasmtime4j.wit.WitS32.of(Integer.parseInt(lex));
+            case U32: return ai.tegmentum.wasmtime4j.wit.WitU32.of(Integer.parseInt(lex));
+            case S64: return ai.tegmentum.wasmtime4j.wit.WitS64.of(Long.parseLong(lex));
+            case U64: return ai.tegmentum.wasmtime4j.wit.WitU64.of(Long.parseLong(lex));
+            case F32: return ai.tegmentum.wasmtime4j.wit.WitFloat32.of(Float.parseFloat(lex));
+            case F64: return ai.tegmentum.wasmtime4j.wit.WitFloat64.of(Double.parseDouble(lex));
+            case CHAR: {
+                if (lex.length() != 1) {
+                    throw new IllegalArgumentException("char: expected exactly one code unit, got `" + lex + "`");
+                }
+                try {
+                    return ai.tegmentum.wasmtime4j.wit.WitChar.of(lex.charAt(0));
+                } catch (ai.tegmentum.wasmtime4j.exception.ValidationException e) {
+                    throw new IllegalArgumentException("char: invalid code point in `" + lex + "`", e);
+                }
+            }
+            default: {
+                // Non-primitive: parse lexical form as JSON and rebuild.
+                final com.google.gson.JsonElement json = parseJson(lex);
+                return jsonToWit(json, target);
+            }
+        }
+    }
+
+    private static ai.tegmentum.wasmtime4j.wit.WitString witStringUnchecked(final String s) {
+        try {
+            return ai.tegmentum.wasmtime4j.wit.WitString.of(s);
+        } catch (ai.tegmentum.wasmtime4j.exception.ValidationException e) {
+            throw new IllegalArgumentException("invalid UTF-8 for WIT string: " + s, e);
+        }
+    }
+
+    /**
+     * Parse the lexical form as JSON via Gson — transitively available
+     * from rdf4j-jsonld's dependency graph, no extra codec added.
+     */
+    private static com.google.gson.JsonElement parseJson(final String lex) {
+        try {
+            return com.google.gson.JsonParser.parseString(lex);
+        } catch (com.google.gson.JsonSyntaxException e) {
+            throw new IllegalArgumentException("expected JSON payload, got `" + lex + "`: " + e.getMessage(), e);
+        }
+    }
+
+    private static ai.tegmentum.wasmtime4j.wit.WitValue jsonToWit(
+            final com.google.gson.JsonElement json,
+            final ai.tegmentum.wasmtime4j.component.ComponentTypeDescriptor target) {
+        final ai.tegmentum.wasmtime4j.component.ComponentType kind = target.getType();
+        switch (kind) {
+            case BOOL:
+                return ai.tegmentum.wasmtime4j.wit.WitBool.of(json.getAsBoolean());
+            case S8:  return ai.tegmentum.wasmtime4j.wit.WitS8.of((byte) json.getAsInt());
+            case U8:  return ai.tegmentum.wasmtime4j.wit.WitU8.of((byte) (json.getAsInt() & 0xff));
+            case S16: return ai.tegmentum.wasmtime4j.wit.WitS16.of((short) json.getAsInt());
+            case U16: return ai.tegmentum.wasmtime4j.wit.WitU16.of((short) (json.getAsInt() & 0xffff));
+            case S32: return ai.tegmentum.wasmtime4j.wit.WitS32.of(json.getAsInt());
+            case U32: return ai.tegmentum.wasmtime4j.wit.WitU32.of(json.getAsInt());
+            case S64: return ai.tegmentum.wasmtime4j.wit.WitS64.of(json.getAsLong());
+            case U64: return ai.tegmentum.wasmtime4j.wit.WitU64.of(json.getAsLong());
+            case F32: return ai.tegmentum.wasmtime4j.wit.WitFloat32.of(json.getAsFloat());
+            case F64: return ai.tegmentum.wasmtime4j.wit.WitFloat64.of(json.getAsDouble());
+            case STRING: return witStringUnchecked(json.getAsString());
+            case OPTION: {
+                final ai.tegmentum.wasmtime4j.component.ComponentTypeDescriptor inner =
+                        target.getOptionType();
+                if (json.isJsonNull()) {
+                    return ai.tegmentum.wasmtime4j.wit.WitOption.none(witTypeOf(inner));
+                }
+                return ai.tegmentum.wasmtime4j.wit.WitOption.some(
+                        witTypeOf(inner),
+                        jsonToWit(json, inner));
+            }
+            case LIST: {
+                final ai.tegmentum.wasmtime4j.component.ComponentTypeDescriptor elem =
+                        target.getElementType();
+                final com.google.gson.JsonArray arr = json.getAsJsonArray();
+                if (arr.isEmpty()) {
+                    return ai.tegmentum.wasmtime4j.wit.WitList.empty(witTypeOf(elem));
+                }
+                final java.util.List<ai.tegmentum.wasmtime4j.wit.WitValue> out =
+                        new java.util.ArrayList<>(arr.size());
+                for (com.google.gson.JsonElement item : arr) out.add(jsonToWit(item, elem));
+                return ai.tegmentum.wasmtime4j.wit.WitList.of(out);
+            }
+            case RECORD: {
+                // Accommodate a bare-number lexical form (e.g.
+                // `wf:partial(..., "waterproof", 10)` where the guest's
+                // 4th param is a query-opts record with a `limit`
+                // field). Wrap the scalar as `{"limit": N}` and continue.
+                final java.util.Map<String, ai.tegmentum.wasmtime4j.component.ComponentTypeDescriptor> fields =
+                        target.getRecordFields();
+                final com.google.gson.JsonObject obj;
+                if (json.isJsonPrimitive()
+                        && json.getAsJsonPrimitive().isNumber()
+                        && fields.containsKey("limit")) {
+                    obj = new com.google.gson.JsonObject();
+                    obj.add("limit", json);
+                } else {
+                    obj = json.getAsJsonObject();
+                }
+                final ai.tegmentum.wasmtime4j.wit.WitRecord.Builder b =
+                        ai.tegmentum.wasmtime4j.wit.WitRecord.builder();
+                for (java.util.Map.Entry<String, ai.tegmentum.wasmtime4j.component.ComponentTypeDescriptor> e : fields.entrySet()) {
+                    final String name = e.getKey();
+                    final ai.tegmentum.wasmtime4j.component.ComponentTypeDescriptor fieldTy = e.getValue();
+                    final com.google.gson.JsonElement fieldJson = obj.get(name);
+                    if ((fieldJson == null || fieldJson.isJsonNull())
+                            && fieldTy.getType() == ai.tegmentum.wasmtime4j.component.ComponentType.OPTION) {
+                        b.field(name, ai.tegmentum.wasmtime4j.wit.WitOption.none(
+                                witTypeOf(fieldTy.getOptionType())));
+                    } else if (fieldJson == null) {
+                        throw new IllegalArgumentException(
+                                "record missing required field `" + name + "`");
+                    } else {
+                        b.field(name, jsonToWit(fieldJson, fieldTy));
+                    }
+                }
+                return b.build();
+            }
+            default:
+                throw new IllegalArgumentException(
+                        "no JSON→WIT coercion implemented for target kind " + kind);
+        }
+    }
+
+    private static ai.tegmentum.wasmtime4j.wit.WitType witTypeOf(
+            final ai.tegmentum.wasmtime4j.component.ComponentTypeDescriptor d) {
+        final ai.tegmentum.wasmtime4j.component.ComponentType kind = d.getType();
+        switch (kind) {
+            case BOOL: return ai.tegmentum.wasmtime4j.wit.WitType.createBool();
+            case S8: return ai.tegmentum.wasmtime4j.wit.WitType.createS8();
+            case U8: return ai.tegmentum.wasmtime4j.wit.WitType.createU8();
+            case S16: return ai.tegmentum.wasmtime4j.wit.WitType.createS16();
+            case U16: return ai.tegmentum.wasmtime4j.wit.WitType.createU16();
+            case S32: return ai.tegmentum.wasmtime4j.wit.WitType.createS32();
+            case U32: return ai.tegmentum.wasmtime4j.wit.WitType.createU32();
+            case S64: return ai.tegmentum.wasmtime4j.wit.WitType.createS64();
+            case U64: return ai.tegmentum.wasmtime4j.wit.WitType.createU64();
+            case F32: return ai.tegmentum.wasmtime4j.wit.WitType.createFloat32();
+            case F64: return ai.tegmentum.wasmtime4j.wit.WitType.createFloat64();
+            case CHAR: return ai.tegmentum.wasmtime4j.wit.WitType.createChar();
+            case STRING: return ai.tegmentum.wasmtime4j.wit.WitType.createString();
+            case OPTION:
+                return ai.tegmentum.wasmtime4j.wit.WitType.option(witTypeOf(d.getOptionType()));
+            case LIST:
+                return ai.tegmentum.wasmtime4j.wit.WitType.list(witTypeOf(d.getElementType()));
+            case RECORD: {
+                final java.util.Map<String, ai.tegmentum.wasmtime4j.component.ComponentTypeDescriptor> fields =
+                        d.getRecordFields();
+                final java.util.LinkedHashMap<String, ai.tegmentum.wasmtime4j.wit.WitType> out =
+                        new java.util.LinkedHashMap<>();
+                for (java.util.Map.Entry<String, ai.tegmentum.wasmtime4j.component.ComponentTypeDescriptor> e : fields.entrySet()) {
+                    out.put(e.getKey(), witTypeOf(e.getValue()));
+                }
+                final String name = d.getName().orElse("record");
+                return ai.tegmentum.wasmtime4j.wit.WitType.record(name, out);
+            }
+            default:
+                throw new IllegalArgumentException(
+                        "no WitType equivalent implemented for component-type kind " + kind);
+        }
     }
 
     /**
