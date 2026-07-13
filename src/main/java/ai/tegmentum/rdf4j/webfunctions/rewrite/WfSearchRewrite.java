@@ -48,9 +48,13 @@ import java.util.Map;
  *
  * The time-spec is either an ISO-8601 UTC timestamp or the literal
  * {@code rev<N>}. Supported opt keys: {@code highlight}, {@code lang},
- * {@code filter}, {@code limit}, {@code offset}, {@code include_body}.
- * Unknown keys are ignored (no hard fail — future opts stay
- * forward-compatible).
+ * {@code filter}, {@code limit}, {@code offset}, {@code include_body},
+ * {@code after}, {@code before}. The v1.3 range-query keys
+ * ({@code after} / {@code before}) are mutually exclusive with the
+ * {@code @<time-spec>} segment: a URL that names both is rejected at
+ * parse time so the outer rewrite pass leaves the SERVICE untouched
+ * (conservative "unknown SERVICE" fallback). Unknown keys are
+ * ignored (no hard fail — future opts stay forward-compatible).
  *
  * <h3>Rewrite shape</h3>
  *
@@ -241,6 +245,13 @@ public final class WfSearchRewrite implements QueryOptimizer {
                 opts.put(key, val);
             }
         }
+        // v1.3 range keys are mutually exclusive with @<time-spec>. Reject
+        // the URL rather than silently dropping one side — the outer rewrite
+        // pass treats the null sentinel as "not a wf-search URL" and leaves
+        // the SERVICE untouched.
+        if (timeSpec != null && (opts.containsKey("after") || opts.containsKey("before"))) {
+            return null;
+        }
         return new ParsedUrl(name, timeSpec, opts);
     }
 
@@ -286,9 +297,12 @@ public final class WfSearchRewrite implements QueryOptimizer {
     /**
      * Build the opts JSON that the guest sees. Only the memo-declared
      * keys pass through ({@code highlight}, {@code lang}, {@code filter},
-     * {@code offset}, {@code include_body}); {@code limit} is a separate
-     * positional arg so it's stripped here. The time-spec is baked into
-     * {@code at_time} (ISO-8601) or {@code at_rev} (numeric).
+     * {@code offset}, {@code include_body}, {@code after}, {@code before});
+     * {@code limit} is a separate positional arg so it's stripped here.
+     * The time-spec is baked into {@code at_time} (ISO-8601) or
+     * {@code at_rev} (numeric). The v1.3 range keys ({@code after} /
+     * {@code before}) are verbatim string pass-through — the guest owns
+     * range interpretation.
      */
     private static String buildOptsJson(final String timeSpec, final Map<String, String> opts) {
         final StringBuilder sb = new StringBuilder();
@@ -336,7 +350,7 @@ public final class WfSearchRewrite implements QueryOptimizer {
                         // Malformed — silently drop, don't fail the rewrite.
                     }
                 }
-                case "lang", "filter" -> {
+                case "lang", "filter", "after", "before" -> {
                     if (!first) sb.append(',');
                     sb.append('"').append(k).append("\":\"")
                             .append(jsonEscape(v)).append('"');

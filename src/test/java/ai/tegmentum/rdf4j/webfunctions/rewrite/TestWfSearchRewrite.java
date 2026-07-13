@@ -183,6 +183,36 @@ public class TestWfSearchRewrite {
         assertThat(WfSearchRewrite.parseUrl("wf-search:?highlight=true")).isNull();
     }
 
+    @Test
+    public void parsesRangeOpts() {
+        // v1.3: after / before pass through as verbatim opt strings when
+        // no @<time-spec> is present.
+        final WfSearchRewrite.ParsedUrl p = WfSearchRewrite.parseUrl(
+                "wf-search:manuals?after=2026-01-01&before=2026-06-01");
+        assertThat(p).isNotNull();
+        assertThat(p.name).isEqualTo("manuals");
+        assertThat(p.timeSpec).isNull();
+        assertThat(p.opts)
+                .containsEntry("after", "2026-01-01")
+                .containsEntry("before", "2026-06-01");
+    }
+
+    @Test
+    public void rejectsAtTimeWithRange() {
+        // @<time-spec> and after/before are mutually exclusive at parse
+        // time — the parser returns the null sentinel so the outer
+        // rewrite pass leaves the SERVICE untouched.
+        assertThat(WfSearchRewrite.parseUrl(
+                "wf-search:manuals@2026-01-01?after=2025-01-01"))
+                .isNull();
+        assertThat(WfSearchRewrite.parseUrl(
+                "wf-search:manuals@rev17?before=2026-06-01"))
+                .isNull();
+        assertThat(WfSearchRewrite.parseUrl(
+                "wf-search:manuals@2026-01-01?after=2025-01-01&before=2026-06-01"))
+                .isNull();
+    }
+
     // ---------------------------------------------------------------------
     // End-to-end rewrite tests
     // ---------------------------------------------------------------------
@@ -234,6 +264,31 @@ public class TestWfSearchRewrite {
         assertThat(optsArg(spec))
                 .contains("\"at_time\":\"2026-01-01T00:00:00Z\"")
                 .contains("\"include_body\":true");
+    }
+
+    @Test
+    public void rewritesWithRangeService() {
+        // v1.3: after / before land in opts_json as string pass-throughs
+        // and no at_time / at_rev is baked in.
+        final DocumentRegistry reg = manualsRegistry();
+        final InvokeRegistry inv = new InvokeRegistry();
+        final ParsedQuery pq = parse(""
+                + "PREFIX wf: <http://tegmentum.ai/ns/webfunction/>\n"
+                + "SELECT ?doc WHERE {\n"
+                + "  SERVICE <wf-search:manuals?after=2026-01-01&before=2026-06-01> {\n"
+                + "    ?_ wf:query \"waterproof\" ; wf:doc ?doc\n"
+                + "  }\n"
+                + "}");
+        final WfSearchRewrite rw = new WfSearchRewrite(reg, inv);
+        assertThat(rw.rewritePattern(pq.getTupleExpr())).isEqualTo(1);
+        assertThat(hasWfInvokeService(pq.getTupleExpr())).isTrue();
+
+        final InvokeSpec spec = takeFirstInvoke(inv);
+        assertThat(optsArg(spec))
+                .contains("\"after\":\"2026-01-01\"")
+                .contains("\"before\":\"2026-06-01\"")
+                .doesNotContain("at_time")
+                .doesNotContain("at_rev");
     }
 
     @Test
