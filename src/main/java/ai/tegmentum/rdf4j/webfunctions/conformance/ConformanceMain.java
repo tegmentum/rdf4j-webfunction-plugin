@@ -11,9 +11,15 @@ import ai.tegmentum.rdf4j.webfunctions.rewrite.FulltextRegistry;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.RewritePipeline;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.ShapeEntry;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.ShapeRegistry;
+import org.eclipse.rdf4j.model.Statement;
 import org.eclipse.rdf4j.query.BindingSet;
+import org.eclipse.rdf4j.query.BooleanQuery;
+import org.eclipse.rdf4j.query.GraphQuery;
+import org.eclipse.rdf4j.query.GraphQueryResult;
+import org.eclipse.rdf4j.query.Query;
 import org.eclipse.rdf4j.query.TupleQuery;
 import org.eclipse.rdf4j.query.TupleQueryResult;
+import org.eclipse.rdf4j.query.impl.MapBindingSet;
 import org.eclipse.rdf4j.query.resultio.sparqljson.SPARQLResultsJSONWriter;
 import org.eclipse.rdf4j.repository.RepositoryConnection;
 import org.eclipse.rdf4j.repository.sail.SailRepository;
@@ -186,18 +192,34 @@ public final class ConformanceMain {
                 conn.add(parsed.data.toFile(), null, RDFFormat.TURTLE);
 
                 final String sparql = Files.readString(parsed.query);
-                final TupleQuery q = conn.prepareTupleQuery(sparql);
-
-                final SPARQLResultsJSONWriter writer = new SPARQLResultsJSONWriter(out);
-                try (TupleQueryResult results = q.evaluate()) {
-                    final AliasRewriteState aliasState = pipeline.aliasState();
-                    writer.startQueryResult(new ArrayList<>(results.getBindingNames()));
-                    while (results.hasNext()) {
-                        final BindingSet in = results.next();
-                        final BindingSet rewritten = aliasState == null ? in : aliasState.rewriteBindingSet(in);
-                        writer.handleSolution(rewritten);
+                // Dispatch on query shape. SELECT is the historical happy
+                // path; CONSTRUCT / DESCRIBE surface their triples as an
+                // s/p/o tuple-shape SPARQL Results JSON so the conformance
+                // runner (which canonicalises Results JSON only) can compare
+                // without a graph-shape-aware code path. ASK bypasses the
+                // JSON writer entirely and writes the SPARQL Results JSON
+                // boolean shape directly.
+                final Query rawQuery = conn.prepareQuery(sparql);
+                if (rawQuery instanceof TupleQuery tq) {
+                    final SPARQLResultsJSONWriter writer = new SPARQLResultsJSONWriter(out);
+                    try (TupleQueryResult results = tq.evaluate()) {
+                        final AliasRewriteState aliasState = pipeline.aliasState();
+                        writer.startQueryResult(new ArrayList<>(results.getBindingNames()));
+                        while (results.hasNext()) {
+                            final BindingSet in = results.next();
+                            final BindingSet rewritten = aliasState == null ? in : aliasState.rewriteBindingSet(in);
+                            writer.handleSolution(rewritten);
+                        }
+                        writer.endQueryResult();
                     }
-                    writer.endQueryResult();
+                } else if (rawQuery instanceof BooleanQuery bq) {
+                    writeAskAsJson(out, bq.evaluate());
+                } else if (rawQuery instanceof GraphQuery gq) {
+                    writeGraphAsSpoJson(out, gq, pipeline.aliasState());
+                } else {
+                    throw new IllegalArgumentException(
+                            "conformance-main: unsupported query shape: "
+                                    + rawQuery.getClass().getName());
                 }
                 out.flush();
             }
@@ -205,6 +227,50 @@ public final class ConformanceMain {
             repo.shutDown();
         }
         return 0;
+    }
+
+    // ---- non-SELECT query shape helpers -----------------------------------
+
+    /**
+     * Emit the SPARQL 1.1 Results JSON boolean serialization —
+     * {@code {"head":{},"boolean":true|false}} — for an ASK result.
+     * Hand-rolled rather than routed through
+     * {@link SPARQLResultsJSONWriter} because that writer's API is
+     * bound to the tuple-shape response only.
+     */
+    private static void writeAskAsJson(final PrintStream out, final boolean answer) {
+        out.print("{\"head\":{},\"boolean\":");
+        out.print(answer ? "true" : "false");
+        out.print('}');
+    }
+
+    /**
+     * Serialize a {@link GraphQuery} result as a tuple-shape SPARQL Results
+     * JSON with columns {@code ?s}, {@code ?p}, {@code ?o} — one row per
+     * statement in the CONSTRUCT / DESCRIBE output. Runs each binding
+     * through {@link AliasRewriteState#rewriteBindingSet} so output IRIs
+     * come back under whatever alias the query mentioned, matching the
+     * wrapping the SELECT path already performs.
+     */
+    private static void writeGraphAsSpoJson(final PrintStream out,
+                                            final GraphQuery gq,
+                                            final AliasRewriteState aliasState) {
+        final SPARQLResultsJSONWriter writer = new SPARQLResultsJSONWriter(out);
+        final List<String> spo = List.of("s", "p", "o");
+        writer.startQueryResult(new ArrayList<>(spo));
+        try (GraphQueryResult results = gq.evaluate()) {
+            while (results.hasNext()) {
+                final Statement st = results.next();
+                final MapBindingSet bs = new MapBindingSet();
+                bs.setBinding("s", st.getSubject());
+                bs.setBinding("p", st.getPredicate());
+                bs.setBinding("o", st.getObject());
+                final BindingSet rewritten = aliasState == null
+                        ? bs : aliasState.rewriteBindingSet(bs);
+                writer.handleSolution(rewritten);
+            }
+        }
+        writer.endQueryResult();
     }
 
     // ---- argument parsing -------------------------------------------------
