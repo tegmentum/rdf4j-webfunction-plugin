@@ -194,6 +194,18 @@ public final class ShapeRewrite implements QueryOptimizer {
      */
     private TupleExpr tryRewrite(final List<StatementPattern> patterns) {
         if (patterns.isEmpty()) return null;
+        // Do NOT rewrite patterns inside `GRAPH ?g { ... }` clauses.
+        // RDF4J models a GRAPH context by attaching a `contextVar` to
+        // every StatementPattern inside the clause. Rewriting to a
+        // wf:call SERVICE would strip that context — the sink is a
+        // SQLite side-channel with no named-graph provenance to hand
+        // back for the outer `?g` binding. Leave the BGP alone so
+        // store semantics apply (0 rows against an empty named-graph
+        // dataset, matching Jena and SPARQL 1.1). See wf-conformance
+        // graph_shape_interaction.toml.
+        for (StatementPattern sp : patterns) {
+            if (sp.getContextVar() != null) return null;
+        }
         final Var subjectVar = sharedSubjectVar(patterns);
         if (subjectVar == null) return null;
 
