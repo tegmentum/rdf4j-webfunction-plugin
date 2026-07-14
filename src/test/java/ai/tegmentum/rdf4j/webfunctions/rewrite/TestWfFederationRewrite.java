@@ -19,8 +19,10 @@ import org.junit.Test;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.OptionalLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -634,5 +636,112 @@ public class TestWfFederationRewrite {
         assertThat(svc.isSilent())
                 .as("wf-search sources default to non-SILENT when `silent` is omitted")
                 .isFalse();
+    }
+
+    // ---------------------------------------------------------------------
+    // v0.2 cost model — cardinality-based reorder
+    // ---------------------------------------------------------------------
+
+    private static FederationSource sparqlWithCard(final String name,
+                                                   final String endpoint,
+                                                   final OptionalLong cardHint,
+                                                   final Map<String, Long> perPredHints,
+                                                   final String... preds) {
+        return new FederationSource(name, SourceType.SPARQL, endpoint,
+                List.of(preds), OptionalInt.empty(), Optional.empty(),
+                cardHint, perPredHints);
+    }
+
+    /** Return the URLs of every Service in visit (depth-first) order. */
+    private static List<String> serviceRefUrlsInOrder(final TupleExpr expr) {
+        final List<String> out = new ArrayList<>();
+        for (Service s : collectServices(expr)) out.add(serviceRefUrl(s));
+        return out;
+    }
+
+    /**
+     * With cardinality hints, sources sort smallest-first regardless of
+     * alphabetical order. {@code zebra} (100) beats {@code alpha} (5000).
+     */
+    @Test
+    public void cardinalityReordersSmallerFirst() {
+        final FederationRegistry reg = FederationRegistry.of(List.of(
+                sparqlWithCard("alpha", "http://alpha/q",
+                        OptionalLong.of(5000), Map.of(), "http://ex/a"),
+                sparqlWithCard("zebra", "http://zebra/q",
+                        OptionalLong.of(100), Map.of(), "http://ex/z")));
+        final InvokeRegistry inv = new InvokeRegistry();
+        final ParsedQuery pq = parse(
+                "SELECT ?s ?a ?z WHERE {\n"
+                        + "  ?s <http://ex/a> ?a .\n"
+                        + "  ?s <http://ex/z> ?z .\n"
+                        + "}");
+        new WfFederationRewrite(reg, inv).rewritePattern(pq.getTupleExpr());
+        final List<String> iris = serviceRefUrlsInOrder(pq.getTupleExpr());
+        final int zebraPos = indexOfContaining(iris, "zebra");
+        final int alphaPos = indexOfContaining(iris, "alpha");
+        assertThat(zebraPos)
+                .as("zebra (100 rows) must precede alpha (5000); iris=" + iris)
+                .isLessThan(alphaPos);
+    }
+
+    /** Unknown-cardinality sources sort last (Long.MAX_VALUE default). */
+    @Test
+    public void unknownCardinalitySortsLast() {
+        final FederationRegistry reg = FederationRegistry.of(List.of(
+                sparqlWithCard("known", "http://known/q",
+                        OptionalLong.of(200), Map.of(), "http://ex/k"),
+                sparqlWithCard("unknown", "http://unknown/q",
+                        OptionalLong.empty(), Map.of(), "http://ex/u")));
+        final InvokeRegistry inv = new InvokeRegistry();
+        final ParsedQuery pq = parse(
+                "SELECT ?s ?k ?u WHERE {\n"
+                        + "  ?s <http://ex/k> ?k .\n"
+                        + "  ?s <http://ex/u> ?u .\n"
+                        + "}");
+        new WfFederationRewrite(reg, inv).rewritePattern(pq.getTupleExpr());
+        final List<String> iris = serviceRefUrlsInOrder(pq.getTupleExpr());
+        final int knownPos = indexOfContaining(iris, "known");
+        final int unknownPos = indexOfContaining(iris, "unknown");
+        assertThat(knownPos)
+                .as("unknown-card source must sort last; iris=" + iris)
+                .isLessThan(unknownPos);
+    }
+
+    /**
+     * Per-predicate hints override source-wide hints for the matched
+     * predicate. Source {@code a} has source-wide 5000 but per-predicate
+     * override 10 for ex:cheap; source {@code b} has 100 flat. {@code a}
+     * should win on ex:cheap.
+     */
+    @Test
+    public void perPredicateCardinalityWins() {
+        final FederationRegistry reg = FederationRegistry.of(List.of(
+                sparqlWithCard("a", "http://a/q",
+                        OptionalLong.of(5000),
+                        Map.of("http://ex/cheap", 10L),
+                        "http://ex/cheap"),
+                sparqlWithCard("b", "http://b/q",
+                        OptionalLong.of(100), Map.of(), "http://ex/mid")));
+        final InvokeRegistry inv = new InvokeRegistry();
+        final ParsedQuery pq = parse(
+                "SELECT ?s ?c ?m WHERE {\n"
+                        + "  ?s <http://ex/cheap> ?c .\n"
+                        + "  ?s <http://ex/mid>   ?m .\n"
+                        + "}");
+        new WfFederationRewrite(reg, inv).rewritePattern(pq.getTupleExpr());
+        final List<String> iris = serviceRefUrlsInOrder(pq.getTupleExpr());
+        final int aPos = indexOfContaining(iris, "http://a");
+        final int bPos = indexOfContaining(iris, "http://b");
+        assertThat(aPos)
+                .as("a (per-pred 10) must precede b (100); iris=" + iris)
+                .isLessThan(bPos);
+    }
+
+    private static int indexOfContaining(final List<String> list, final String needle) {
+        for (int i = 0; i < list.size(); i++) {
+            if (list.get(i).contains(needle)) return i;
+        }
+        return -1;
     }
 }

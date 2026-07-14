@@ -9,6 +9,7 @@ import org.junit.Test;
 
 import java.util.List;
 import java.util.OptionalInt;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -230,6 +231,181 @@ public class TestFederationRegistry {
         assertThat(reg.size()).isEqualTo(2);
         assertThat(reg.byName("b").probeTtlSecs()).hasValue(120);
         assertThat(reg.findByPredicate("http://ex/p1"))
+                .extracting(FederationSource::name)
+                .containsExactly("a");
+    }
+
+    // ---------------------------------------------------------------------
+    // v0.2 cost model — cardinality hints
+    // ---------------------------------------------------------------------
+
+    @Test
+    public void cardinalityHintParsesAndSurvivesRoundtrip() {
+        final FederationRegistry reg = parse("""
+                {"sources": [{
+                    "name": "products",
+                    "type": "sparql",
+                    "endpoint": "http://ex/query",
+                    "predicates": ["http://ex/sku"],
+                    "cardinality_hint": 5000
+                }]}""");
+        final FederationSource e = reg.byName("products");
+        assertThat(e.cardinalityHint()).hasValue(5000L);
+        assertThat(e.cardinalityFor("http://ex/sku")).hasValue(5000L);
+        // Missing predicate falls back to source-wide hint.
+        assertThat(e.cardinalityFor("http://ex/other")).hasValue(5000L);
+    }
+
+    @Test
+    public void perPredicateCardinalityHintsOverrideSourceHint() {
+        final FederationRegistry reg = parse("""
+                {"sources": [{
+                    "name": "products",
+                    "type": "sparql",
+                    "endpoint": "http://ex/query",
+                    "predicates": ["http://ex/sku", "http://ex/label"],
+                    "cardinality_hint": 5000,
+                    "cardinality_hints": {"http://ex/sku": 100}
+                }]}""");
+        final FederationSource e = reg.byName("products");
+        assertThat(e.cardinalityFor("http://ex/sku")).hasValue(100L);
+        assertThat(e.cardinalityFor("http://ex/label")).hasValue(5000L);
+    }
+
+    @Test
+    public void cardinalityAbsentReturnsEmpty() {
+        final FederationRegistry reg = parse("""
+                {"sources": [{
+                    "name": "products",
+                    "type": "sparql",
+                    "endpoint": "http://ex/query",
+                    "predicates": ["http://ex/sku"]
+                }]}""");
+        assertThat(reg.byName("products").cardinalityFor("http://ex/sku")).isEmpty();
+    }
+
+    // ---------------------------------------------------------------------
+    // v0.2 probe mode
+    // ---------------------------------------------------------------------
+
+    @Test
+    public void probeModeParsesFromJsonRoot() {
+        final FederationRegistry reg = parse("""
+                {
+                    "probe_mode": true,
+                    "probe_ttl_secs": 300,
+                    "sources": [{
+                        "name": "s", "type": "sparql", "endpoint": "http://ex"
+                    }]
+                }""");
+        assertThat(reg.probeMode()).isTrue();
+        assertThat(reg.probeTtlSecs()).isEqualTo(300);
+    }
+
+    @Test
+    public void probeModeDefaultsOffWhenAbsent() {
+        final FederationRegistry reg = parse("""
+                {"sources": [{
+                    "name": "s", "type": "sparql", "endpoint": "http://ex"
+                }]}""");
+        assertThat(reg.probeMode()).isFalse();
+        assertThat(reg.probeTtlSecs()).isEqualTo(3600);
+    }
+
+    @Test
+    public void probeCacheHitAvoidsReprobe() throws Exception {
+        final AtomicInteger calls = new AtomicInteger();
+        final FederationRegistry reg = parse("""
+                {
+                    "probe_mode": true,
+                    "sources": [{
+                        "name": "s",
+                        "type": "sparql",
+                        "endpoint": "http://ex/query"
+                    }]
+                }""").withProbeFn((src, pred) -> {
+                    calls.incrementAndGet();
+                    return true;
+                });
+        final FederationSource src = reg.byName("s");
+        assertThat(reg.probePredicate(src, "http://ex/p")).isTrue();
+        assertThat(reg.probePredicate(src, "http://ex/p")).isTrue();
+        assertThat(calls.get()).as("cache hit must skip re-probe").isEqualTo(1);
+    }
+
+    @Test
+    public void probeCacheTtlExpiryReprobes() throws Exception {
+        final AtomicInteger calls = new AtomicInteger();
+        // 0-second TTL — every lookup is stale.
+        final FederationRegistry reg = parse("""
+                {
+                    "probe_mode": true,
+                    "probe_ttl_secs": 0,
+                    "sources": [{
+                        "name": "s",
+                        "type": "sparql",
+                        "endpoint": "http://ex/query"
+                    }]
+                }""").withProbeFn((src, pred) -> {
+                    calls.incrementAndGet();
+                    return true;
+                });
+        final FederationSource src = reg.byName("s");
+        reg.probePredicate(src, "http://ex/p");
+        // Sleep 5ms past 0 to ensure elapsed > 0-second TTL.
+        Thread.sleep(5);
+        reg.probePredicate(src, "http://ex/p");
+        assertThat(calls.get()).as("TTL expiry must trigger re-probe").isEqualTo(2);
+    }
+
+    @Test
+    public void probeEndpointDownSurfacesError() {
+        final FederationRegistry reg = parse("""
+                {
+                    "probe_mode": true,
+                    "sources": [{
+                        "name": "s",
+                        "type": "sparql",
+                        "endpoint": "http://ex/query"
+                    }]
+                }""").withProbeFn((src, pred) -> {
+                    throw new java.net.ConnectException("connection refused");
+                });
+        final FederationSource src = reg.byName("s");
+        assertThatThrownBy(() -> reg.probePredicate(src, "http://ex/p"))
+                .isInstanceOf(java.net.ConnectException.class)
+                .hasMessageContaining("connection refused");
+    }
+
+    @Test
+    public void probeModeExtendsFindByPredicate() {
+        // 'declared' has ex:p statically; 'undeclared' does not but
+        // probes true. findByPredicateProbing surfaces both.
+        final FederationRegistry reg = parse("""
+                {
+                    "probe_mode": true,
+                    "sources": [
+                        {"name": "declared", "type": "sparql",
+                         "endpoint": "http://a/query",
+                         "predicates": ["http://ex/p"]},
+                        {"name": "undeclared", "type": "sparql",
+                         "endpoint": "http://b/query"}
+                    ]
+                }""").withProbeFn((src, pred) -> "undeclared".equals(src.name()));
+        final List<FederationSource> hits = reg.findByPredicateProbing("http://ex/p");
+        assertThat(hits).extracting(FederationSource::name)
+                .containsExactlyInAnyOrder("declared", "undeclared");
+    }
+
+    @Test
+    public void probeModeOffIsStaticOnly() {
+        final FederationRegistry reg = parse("""
+                {"sources": [
+                    {"name": "a", "type": "sparql", "endpoint": "http://a",
+                     "predicates": ["http://ex/p"]}
+                ]}""");
+        // findByPredicateProbing matches findByPredicate when probe mode is off.
+        assertThat(reg.findByPredicateProbing("http://ex/p"))
                 .extracting(FederationSource::name)
                 .containsExactly("a");
     }

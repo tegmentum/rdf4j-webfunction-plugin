@@ -27,8 +27,8 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.Set;
-import java.util.TreeMap;
 
 /**
  * Static-mode federation planner. Walks a query's BGPs and assigns each
@@ -198,43 +198,70 @@ public final class WfFederationRewrite implements QueryOptimizer {
     private TupleExpr tryRewriteBgp(final List<StatementPattern> sps) {
         if (sps.isEmpty()) return null;
 
-        // Step 1: assignments per SP.
+        // Step 1: assignments per SP. v0.2: `findByPredicateProbing`
+        // returns statically-declared sources union with any that probe
+        // affirmatively via ASK (static-only registries fall through
+        // to identical behavior).
         final List<List<FederationSource>> assigned = new ArrayList<>(sps.size());
+        final List<String> predIris = new ArrayList<>(sps.size());
         boolean anyRegistered = false;
         for (StatementPattern sp : sps) {
             final Var pVar = sp.getPredicateVar();
             List<FederationSource> matches = List.of();
-            if (pVar != null && pVar.hasValue() && pVar.getValue() instanceof IRI predIri) {
-                matches = registry.findByPredicate(predIri.stringValue());
+            String predIri = "";
+            if (pVar != null && pVar.hasValue() && pVar.getValue() instanceof IRI iri) {
+                predIri = iri.stringValue();
+                matches = registry.findByPredicateProbing(predIri);
             }
             assigned.add(matches);
+            predIris.add(predIri);
             if (!matches.isEmpty()) anyRegistered = true;
         }
         if (!anyRegistered) return null;
 
-        // Step 2: partition SPs into single-source, multi-source, unregistered.
-        // TreeMap so per-source groups emit in lexicographic order — the
-        // v0.1 "uniform cost, deterministic" reorder (memo §11 step 2).
-        final Map<String, List<StatementPattern>> singleSource = new TreeMap<>();
+        // Step 2: partition SPs into single-source, multi-source,
+        // unregistered. Plain HashMap now — the ordering-by-cardinality
+        // sort at emission time replaces the TreeMap's alphabetical
+        // ordering (memo §04 step 4 / §07 cost model).
+        final Map<String, List<StatementPattern>> singleSource = new HashMap<>();
+        // v0.2 per-source cardinality tracker: min cardinality observed
+        // across every triple assigned to a source. Missing entry means
+        // "unknown"; sort those last via Long.MAX_VALUE. Sources appear
+        // in both singleSource and multi participate in the min.
+        final Map<String, Long> sourceMinCard = new HashMap<>();
         final List<MultiSourceEntry> multi = new ArrayList<>();
         final List<StatementPattern> unregistered = new ArrayList<>();
         for (int i = 0; i < sps.size(); i++) {
             final StatementPattern sp = sps.get(i);
             final List<FederationSource> m = assigned.get(i);
+            final String predIri = predIris.get(i);
             if (m.isEmpty()) {
                 unregistered.add(sp);
             } else if (m.size() == 1) {
+                updateMinCard(sourceMinCard, m.get(0).name(), m.get(0).cardinalityFor(predIri));
                 singleSource.computeIfAbsent(m.get(0).name(), k -> new ArrayList<>()).add(sp);
             } else {
+                for (FederationSource s : m) {
+                    updateMinCard(sourceMinCard, s.name(), s.cardinalityFor(predIri));
+                }
                 multi.add(new MultiSourceEntry(sp, m));
             }
         }
 
-        // Step 3: build parts.
+        // Step 3: build parts. v0.2 cost model — emit single-source
+        // SERVICE clauses in cardinality order (smaller first),
+        // tie-breaking on source name for determinism.
         final List<TupleExpr> parts = new ArrayList<>();
-        for (Map.Entry<String, List<StatementPattern>> e : singleSource.entrySet()) {
-            final FederationSource src = registry.byName(e.getKey());
-            for (List<StatementPattern> comp : connectedComponents(e.getValue())) {
+        final List<String> sortedSourceNames = new ArrayList<>(singleSource.keySet());
+        sortedSourceNames.sort((a, b) -> {
+            final long ca = sourceMinCard.getOrDefault(a, Long.MAX_VALUE);
+            final long cb = sourceMinCard.getOrDefault(b, Long.MAX_VALUE);
+            final int cmp = Long.compare(ca, cb);
+            return cmp != 0 ? cmp : a.compareTo(b);
+        });
+        for (String name : sortedSourceNames) {
+            final FederationSource src = registry.byName(name);
+            for (List<StatementPattern> comp : connectedComponents(singleSource.get(name))) {
                 parts.add(buildService(src, comp));
             }
         }
@@ -249,6 +276,18 @@ public final class WfFederationRewrite implements QueryOptimizer {
             parts.add(sp.clone());
         }
         return joinAll(parts);
+    }
+
+    /**
+     * Update the per-source min-cardinality tracker. Present + numeric
+     * beats present + numeric via {@link Math#min}; empty (unknown)
+     * leaves the tracker unchanged.
+     */
+    private static void updateMinCard(final Map<String, Long> tracker,
+                                      final String sourceName,
+                                      final OptionalLong card) {
+        if (card.isEmpty()) return;
+        tracker.merge(sourceName, card.getAsLong(), Math::min);
     }
 
     /**
