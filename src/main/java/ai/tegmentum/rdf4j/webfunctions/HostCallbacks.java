@@ -401,9 +401,15 @@ public final class HostCallbacks {
                     case "sqlite":
                         sink = SqliteSink.open(url);
                         break;
+                    case "postgres":
+                    case "postgresql":
+                        // wf_relational v0.1: Postgres via the standard
+                        // libpq URL. postgresql:// accepted as an alias.
+                        sink = PostgresSink.open(url);
+                        break;
                     default:
                         return new Object[] { ComponentVal.err(ComponentVal.string(
-                            "sink scheme `" + scheme + "` not supported (v0.5 ships sqlite)")) };
+                            "sink scheme `" + scheme + "` not supported (v0.5 ships sqlite, postgres)")) };
                 }
                 final int handle = ctx.registerSink(sink);
                 return new Object[] { ComponentVal.ok(ComponentVal.u32((long) handle)) };
