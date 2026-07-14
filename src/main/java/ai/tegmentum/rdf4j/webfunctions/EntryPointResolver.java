@@ -9,8 +9,8 @@ import java.util.List;
  * exported function names.
  *
  * <p>Substrate-wide entry-point contract, mirroring
- * {@code oxigraph-wf/src/wf_call.rs::resolve_entry_point} (commit
- * {@code 3a92707}). Resolution proceeds in the following order:
+ * {@code oxigraph-wf/src/wf_call.rs::resolve_entry_point}. Resolution
+ * proceeds in the following order:
  *
  * <ol>
  *   <li>Caller override — if the caller supplies a name (via e.g.
@@ -18,9 +18,14 @@ import java.util.List;
  *   <li>Substrate default — {@code evaluate}, if present. Every
  *       existing guest shipped under {@code stardog:webfunction} exports
  *       {@code evaluate}, so this is the backwards-compatible case.</li>
- *   <li>Single top-level function export — used when the guest's WIT
- *       world names its export differently (e.g. {@code wf_fulltext}
- *       exports {@code search}).</li>
+ *   <li>Well-known primary export from {@link #WELL_KNOWN_ENTRY_POINTS}
+ *       (in order). Covers domain WIT worlds like {@code wf:fulltext}
+ *       that export {@code search} alongside admin/mutation entry
+ *       points such as {@code insert-batch} and {@code delete-batch};
+ *       the query dispatch is the SPARQL-facing surface, so it wins
+ *       the auto-detect.</li>
+ *   <li>Single top-level function export — retained for guests whose
+ *       WIT world names its export off the well-known list.</li>
  *   <li>Otherwise raises, listing the visible exports so the caller can
  *       pick one via an explicit override.</li>
  * </ol>
@@ -37,6 +42,13 @@ public final class EntryPointResolver {
     public static final String DEFAULT_ENTRY_POINT = "evaluate";
 
     /**
+     * Well-known primary export names, in preference order. Used as
+     * the step-3 heuristic when a guest ships no {@code evaluate}.
+     */
+    public static final List<String> WELL_KNOWN_ENTRY_POINTS =
+            List.of("search", "execute", "run", "dispatch");
+
+    /**
      * Resolve the entry-point name to invoke on a guest with the given
      * function exports. See class Javadoc for the resolution order.
      *
@@ -47,6 +59,7 @@ public final class EntryPointResolver {
      * @return the resolved entry-point name; never {@code null}
      * @throws IllegalStateException on ambiguous multi-export guests
      *                               that ship no {@code evaluate}
+     *                               and no well-known primary export
      */
     public static String resolve(final List<String> exportedFunctions,
                                  final String override) {
@@ -63,6 +76,16 @@ public final class EntryPointResolver {
                 return DEFAULT_ENTRY_POINT;
             }
         }
+        // Prefer a well-known primary export before falling back to
+        // the single-export path — this is what lets multi-export
+        // domain guests (wf_fulltext exports search + insert-batch +
+        // delete-batch) dispatch under raw wf:partial(<wasm>, ...)
+        // without a per-callsite entry_point override.
+        for (String candidate : WELL_KNOWN_ENTRY_POINTS) {
+            if (exportedFunctions.contains(candidate)) {
+                return candidate;
+            }
+        }
         // Fall back to a single function export.
         final List<String> distinct = new ArrayList<>();
         for (String name : exportedFunctions) {
@@ -73,7 +96,8 @@ public final class EntryPointResolver {
         }
         throw new IllegalStateException(
                 "component has multiple function exports [" + String.join(", ", distinct)
-                        + "] and no `evaluate` — specify one via wf:partial's "
-                        + "entry_point override on InvokeSpec");
+                        + "] and no `evaluate` or well-known primary export ("
+                        + String.join(", ", WELL_KNOWN_ENTRY_POINTS)
+                        + ") — specify one via wf:partial's entry_point override on InvokeSpec");
     }
 }

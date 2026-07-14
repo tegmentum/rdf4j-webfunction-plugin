@@ -9,12 +9,13 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Substrate-wide entry-point resolution parity check. Mirrors the
- * resolver in {@code oxigraph-wf/src/wf_call.rs::resolve_entry_point}
- * (commit {@code 3a92707}). The four-step order must hold:
+ * resolver in {@code oxigraph-wf/src/wf_call.rs::resolve_entry_point}.
+ * The five-step order must hold:
  *
  * <ol>
  *   <li>caller override</li>
  *   <li>{@code evaluate} (substrate default)</li>
+ *   <li>well-known primary export (search / execute / run / dispatch)</li>
  *   <li>single top-level function export</li>
  *   <li>error listing visible exports</li>
  * </ol>
@@ -46,16 +47,42 @@ public class TestEntryPointResolution {
         assertThat(resolved).isEqualTo("search");
     }
 
+    /**
+     * The wf_fulltext guest exports {@code search, insert-batch,
+     * delete-batch}. {@code search} is a well-known primary export, so
+     * it wins over the admin/mutation exports. Closes the multi-export
+     * ambiguity that blocked fulltext_document_corpus.
+     */
+    @Test
+    public void picksSearchOverAdminExportsOnWfFulltext() {
+        final String resolved = EntryPointResolver.resolve(
+                List.of("search", "insert-batch", "delete-batch"), null);
+        assertThat(resolved).isEqualTo("search");
+    }
+
+    /**
+     * Well-known list is scanned in preference order: {@code search}
+     * beats {@code execute} when both are present.
+     */
+    @Test
+    public void wellKnownListHonoursOrder() {
+        final String resolved = EntryPointResolver.resolve(
+                List.of("execute", "search"), null);
+        assertThat(resolved).isEqualTo("search");
+    }
+
     @Test
     public void errorsOnAmbiguousMultiExportGuest() {
-        // No `evaluate`, and multiple top-level exports — the resolver
-        // has no way to pick one and must surface the export list so
-        // the caller can supply an override.
+        // No `evaluate`, no well-known primary, and multiple top-level
+        // exports — the resolver has no way to pick one and must
+        // surface the export list so the caller can supply an
+        // override. Names picked outside WELL_KNOWN_ENTRY_POINTS so the
+        // step-3 heuristic doesn't fire.
         assertThatThrownBy(() ->
-                EntryPointResolver.resolve(List.of("search", "index-put"), null))
+                EntryPointResolver.resolve(List.of("cancel", "index-put"), null))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("multiple function exports")
-                .hasMessageContaining("search")
+                .hasMessageContaining("cancel")
                 .hasMessageContaining("index-put");
     }
 
