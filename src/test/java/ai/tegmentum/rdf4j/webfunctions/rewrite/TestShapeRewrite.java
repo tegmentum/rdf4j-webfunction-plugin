@@ -86,6 +86,86 @@ public class TestShapeRewrite {
     }
 
     @Test
+    public void graphVarWrapsServiceInExtensionBindingVirtualIri() {
+        // `GRAPH ?g { ?s :name ?n; :age ?a }` — the rewrite emits a
+        // SERVICE wrapped in an Extension that binds ?g to the
+        // shape's virtual IRI.
+        final String query = ""
+                + "SELECT * WHERE {\n"
+                + "  GRAPH ?g { ?s <http://example/name> ?n . ?s <http://example/age> ?a . }\n"
+                + "}";
+        final ParsedQuery parsed = new SPARQLParser().parseQuery(query, null);
+        final ShapeRegistry registry = ShapeRegistry.of(List.of(personShape()));
+        final ShapeRewrite rewrite = new ShapeRewrite(registry, "http://wf/fetch.wasm");
+        final int count = rewrite.rewritePattern(parsed.getTupleExpr());
+        assertThat(count).isEqualTo(1);
+        // The SERVICE must be emitted, and there must be an Extension
+        // that binds ?g to <urn:wf:shape:person>.
+        assertThat(collectServices(parsed.getTupleExpr())).hasSize(1);
+        assertThat(collectExtensions(parsed.getTupleExpr()))
+                .anySatisfy(ext -> {
+                    final boolean bindsG = ext.getElements().stream().anyMatch(el ->
+                            "g".equals(el.getName())
+                                    && el.getExpr() instanceof org.eclipse.rdf4j.query.algebra.ValueConstant vc
+                                    && ShapeRewrite.shapeVirtualGraphIri("person")
+                                            .equals(vc.getValue().stringValue()));
+                    assertThat(bindsG).as("Extension binds ?g to virtual shape IRI").isTrue();
+                });
+    }
+
+    @Test
+    public void graphMatchingVirtualIriUnwrapsToPlainService() {
+        // `GRAPH <urn:wf:shape:person> { ... }` — the outer IRI is
+        // the shape's virtual IRI, so the rewrite fires and emits
+        // a plain SERVICE with no Extension wrapper on ?g.
+        final String virt = ShapeRewrite.shapeVirtualGraphIri("person");
+        final String query = ""
+                + "SELECT * WHERE {\n"
+                + "  GRAPH <" + virt + "> { ?s <http://example/name> ?n . ?s <http://example/age> ?a . }\n"
+                + "}";
+        final ParsedQuery parsed = new SPARQLParser().parseQuery(query, null);
+        final ShapeRegistry registry = ShapeRegistry.of(List.of(personShape()));
+        final ShapeRewrite rewrite = new ShapeRewrite(registry, "http://wf/fetch.wasm");
+        final int count = rewrite.rewritePattern(parsed.getTupleExpr());
+        assertThat(count).isEqualTo(1);
+        assertThat(collectServices(parsed.getTupleExpr())).hasSize(1);
+        // No Extension binding a graph variable.
+        assertThat(collectExtensions(parsed.getTupleExpr())).allSatisfy(ext ->
+                assertThat(ext.getElements()).noneMatch(el -> "g".equals(el.getName())));
+    }
+
+    @Test
+    public void graphWithForeignIriLeavesRewriteDisabled() {
+        // `GRAPH <http://example/other> { ... }` — the outer IRI does
+        // not match the shape's virtual IRI, so no rewrite fires; the
+        // StatementPatterns retain their original contextVar.
+        final String query = ""
+                + "SELECT * WHERE {\n"
+                + "  GRAPH <http://example/other> { ?s <http://example/name> ?n . ?s <http://example/age> ?a . }\n"
+                + "}";
+        final ParsedQuery parsed = new SPARQLParser().parseQuery(query, null);
+        final ShapeRegistry registry = ShapeRegistry.of(List.of(personShape()));
+        final ShapeRewrite rewrite = new ShapeRewrite(registry, "http://wf/fetch.wasm");
+        final int count = rewrite.rewritePattern(parsed.getTupleExpr());
+        assertThat(count).isZero();
+        assertThat(collectServices(parsed.getTupleExpr())).isEmpty();
+    }
+
+    private static List<org.eclipse.rdf4j.query.algebra.Extension> collectExtensions(
+            final org.eclipse.rdf4j.query.algebra.TupleExpr expr) {
+        final List<org.eclipse.rdf4j.query.algebra.Extension> out = new java.util.ArrayList<>();
+        expr.visit(new AbstractQueryModelVisitor<RuntimeException>() {
+            @Override
+            public void meet(final org.eclipse.rdf4j.query.algebra.Extension ext) {
+                out.add(ext);
+                super.meet(ext);
+            }
+            @Override protected void meetNode(final QueryModelNode n) { n.visitChildren(this); }
+        });
+        return out;
+    }
+
+    @Test
     public void skipsBgpWithForeignPredicate() {
         final String query = ""
                 + "SELECT ?s ?n ?x WHERE {\n"

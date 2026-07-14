@@ -7,11 +7,14 @@ import org.eclipse.rdf4j.model.impl.SimpleValueFactory;
 import org.eclipse.rdf4j.model.vocabulary.RDF;
 import org.eclipse.rdf4j.query.BindingSet;
 import org.eclipse.rdf4j.query.Dataset;
+import org.eclipse.rdf4j.query.algebra.Extension;
+import org.eclipse.rdf4j.query.algebra.ExtensionElem;
 import org.eclipse.rdf4j.query.algebra.Join;
 import org.eclipse.rdf4j.query.algebra.QueryModelNode;
 import org.eclipse.rdf4j.query.algebra.Service;
 import org.eclipse.rdf4j.query.algebra.StatementPattern;
 import org.eclipse.rdf4j.query.algebra.TupleExpr;
+import org.eclipse.rdf4j.query.algebra.ValueConstant;
 import org.eclipse.rdf4j.query.algebra.Var;
 import org.eclipse.rdf4j.query.algebra.evaluation.QueryOptimizer;
 import org.eclipse.rdf4j.query.algebra.helpers.AbstractQueryModelVisitor;
@@ -37,6 +40,27 @@ import java.util.UUID;
  * {@link Join}s whose leaves are all {@link StatementPattern}s. We look
  * at each maximal join-of-SPs subtree with a shared subject variable
  * and rewrite it in place.
+ *
+ * <h2>Virtual per-shape graph</h2>
+ *
+ * <p>A shape logically owns a virtual named graph whose IRI is
+ * {@code urn:wf:shape:<shape-name>}. RDF4J represents a
+ * {@code GRAPH { ... }} clause by attaching a {@code contextVar} to
+ * every {@link StatementPattern} inside &mdash; there is no explicit
+ * OpGraph node. We check that shared contextVar and:
+ *
+ * <ul>
+ *   <li>{@code contextVar == null} (default graph) &mdash; rewrite to
+ *       {@code SERVICE <wf:call>}, no graph binding. Historic path.</li>
+ *   <li>{@code contextVar} is a variable (all SPs same var) &mdash;
+ *       rewrite to {@code SERVICE}, wrap with {@link Extension} binding
+ *       that variable to {@code <urn:wf:shape:X>}.</li>
+ *   <li>{@code contextVar} is a constant IRI equal to
+ *       {@code <urn:wf:shape:X>} &mdash; rewrite to plain SERVICE.</li>
+ *   <li>{@code contextVar} is a constant IRI that isn't the shape's
+ *       virtual IRI &mdash; skip; store semantics apply (typically 0
+ *       rows against a non-existent named graph).</li>
+ * </ul>
  */
 public final class ShapeRewrite implements QueryOptimizer {
 
@@ -47,6 +71,7 @@ public final class ShapeRewrite implements QueryOptimizer {
     private static final String WF_WASM     = WF_NS + "wasm";
     private static final String WF_ARG      = WF_NS + "arg";
     private static final String RDF_TYPE    = RDF.TYPE.stringValue();
+    private static final String SHAPE_GRAPH_PREFIX = "urn:wf:shape:";
 
     private final ShapeRegistry registry;
     private final String wfFetchUrl;
@@ -58,6 +83,11 @@ public final class ShapeRewrite implements QueryOptimizer {
     }
 
     public int rewriteCount() { return rewrites; }
+
+    /** Virtual named-graph IRI for a shape. */
+    public static String shapeVirtualGraphIri(final String shapeName) {
+        return SHAPE_GRAPH_PREFIX + shapeName;
+    }
 
     @Override
     public void optimize(final TupleExpr tupleExpr, final Dataset dataset, final BindingSet bindings) {
@@ -189,23 +219,19 @@ public final class ShapeRewrite implements QueryOptimizer {
     }
 
     /**
-     * Inspect a collected BGP. Return the SERVICE replacement if all
+     * Inspect a collected BGP. Return the SERVICE replacement (with
+     * outer {@link Extension} for the {@code GRAPH ?g} case) if all
      * patterns qualify for the same shape; {@code null} otherwise.
      */
     private TupleExpr tryRewrite(final List<StatementPattern> patterns) {
         if (patterns.isEmpty()) return null;
-        // Do NOT rewrite patterns inside `GRAPH ?g { ... }` clauses.
-        // RDF4J models a GRAPH context by attaching a `contextVar` to
-        // every StatementPattern inside the clause. Rewriting to a
-        // wf:call SERVICE would strip that context — the sink is a
-        // SQLite side-channel with no named-graph provenance to hand
-        // back for the outer `?g` binding. Leave the BGP alone so
-        // store semantics apply (0 rows against an empty named-graph
-        // dataset, matching Jena and SPARQL 1.1). See wf-conformance
-        // graph_shape_interaction.toml.
-        for (StatementPattern sp : patterns) {
-            if (sp.getContextVar() != null) return null;
-        }
+
+        // Shared context across all SPs is the shape's graph scope.
+        // Mixed contexts (some default, some named; or two different
+        // named IRIs) disqualify the BGP.
+        final GraphCtx ctx = sharedGraphContext(patterns);
+        if (ctx == null) return null;
+
         final Var subjectVar = sharedSubjectVar(patterns);
         if (subjectVar == null) return null;
 
@@ -226,10 +252,14 @@ public final class ShapeRewrite implements QueryOptimizer {
             if (oVar == null || oVar.hasValue()) return null;
             columns.add(Map.entry(pStr, oVar));
         }
-        if (columns.isEmpty()) return null;
 
         final ShapeEntry shape = resolveSharedShape(columns, classIri);
         if (shape == null) return null;
+        // Bare `?s a :Widget` case: no column triples, but the anchor
+        // class match alone is enough to dispatch. Require the shape
+        // to have an anchor class so we're not synthesising rows for
+        // a shape that has never claimed one.
+        if (columns.isEmpty() && shape.anchorClass() == null) return null;
 
         // Map (predicate -> column name) using the shape.
         final List<Map.Entry<String, Var>> mapped = new ArrayList<>(columns.size());
@@ -239,7 +269,86 @@ public final class ShapeRewrite implements QueryOptimizer {
             mapped.add(Map.entry(col, e.getValue()));
         }
 
-        return buildService(subjectVar, shape, mapped);
+        // Enforce virtual-graph gating on the constant-IRI context.
+        final String virt = shapeVirtualGraphIri(shape.name());
+        if (ctx.kind == GraphCtxKind.NAMED_IRI && !virt.equals(ctx.iri)) {
+            return null;
+        }
+
+        final TupleExpr service = buildService(subjectVar, shape, mapped);
+
+        // Wrap with Extension(?g = <urn:wf:shape:X>) when the outer
+        // GRAPH was a variable. RDF4J's Extension takes the source
+        // TupleExpr as its arg; the extension elem binds the variable
+        // to the constant value on every row the source yields.
+        if (ctx.kind == GraphCtxKind.NAMED_VAR) {
+            final Extension ext = new Extension(service);
+            ext.addElement(new ExtensionElem(
+                    new ValueConstant(VF.createIRI(virt)),
+                    ctx.varName));
+            return ext;
+        }
+        return service;
+    }
+
+    /** Kinds of shared-graph context across a BGP's SPs. */
+    private enum GraphCtxKind { DEFAULT, NAMED_VAR, NAMED_IRI }
+
+    /**
+     * Shared graph context descriptor: either the default graph, a
+     * named-graph variable ({@code ?g}), or a specific IRI.
+     */
+    private static final class GraphCtx {
+        final GraphCtxKind kind;
+        final String varName;  // set iff NAMED_VAR
+        final String iri;      // set iff NAMED_IRI
+
+        private GraphCtx(final GraphCtxKind kind, final String varName, final String iri) {
+            this.kind = kind;
+            this.varName = varName;
+            this.iri = iri;
+        }
+
+        static GraphCtx defaultGraph() { return new GraphCtx(GraphCtxKind.DEFAULT, null, null); }
+        static GraphCtx var(final String name) { return new GraphCtx(GraphCtxKind.NAMED_VAR, name, null); }
+        static GraphCtx iri(final String iri)  { return new GraphCtx(GraphCtxKind.NAMED_IRI, null, iri); }
+    }
+
+    /**
+     * Determine the shared graph context across all patterns. Returns
+     * null if the patterns disagree (some default + some named, or two
+     * different named IRIs / variables) &mdash; a BGP that spans graph
+     * contexts can't be dispatched to one shape.
+     */
+    private static GraphCtx sharedGraphContext(final List<StatementPattern> patterns) {
+        GraphCtx chosen = null;
+        for (StatementPattern sp : patterns) {
+            final Var ctx = sp.getContextVar();
+            final GraphCtx here;
+            if (ctx == null) {
+                here = GraphCtx.defaultGraph();
+            } else if (ctx.hasValue()) {
+                if (!(ctx.getValue() instanceof IRI iri)) return null;
+                here = GraphCtx.iri(iri.stringValue());
+            } else {
+                here = GraphCtx.var(ctx.getName());
+            }
+            if (chosen == null) {
+                chosen = here;
+            } else if (!sameCtx(chosen, here)) {
+                return null;
+            }
+        }
+        return chosen;
+    }
+
+    private static boolean sameCtx(final GraphCtx a, final GraphCtx b) {
+        if (a.kind != b.kind) return false;
+        return switch (a.kind) {
+            case DEFAULT -> true;
+            case NAMED_VAR -> a.varName.equals(b.varName);
+            case NAMED_IRI -> a.iri.equals(b.iri);
+        };
     }
 
     /** All patterns must share a single (variable) subject. */
@@ -268,6 +377,11 @@ public final class ShapeRewrite implements QueryOptimizer {
             } else if (!shape.name().equals(candidate.name())) {
                 return null;
             }
+        }
+        // Anchor-only fallback: bare `?s a :Widget` picks the shape
+        // whose anchor_class matches, even without any column predicates.
+        if (shape == null && classIri != null) {
+            shape = registry.findByClass(classIri);
         }
         if (shape == null) return null;
         if (classIri != null) {
@@ -302,19 +416,24 @@ public final class ShapeRewrite implements QueryOptimizer {
         final List<StatementPattern> body = new ArrayList<>();
         // Config side. Each SP owns fresh Var instances &mdash; RDF4J's
         // AbstractQueryModelNode asserts each Var has at most one parent.
+        // Also strip contextVar (the outer scope was accounted for above).
         body.add(sp(cVar.clone(), constVar(VF.createIRI(WF_WASM)),
                 constVar(VF.createIRI(wfFetchUrl))));
         body.add(sp(cVar.clone(), constVar(VF.createIRI(WF_ARG)),
                 constVar(VF.createLiteral(shape.descriptorJson()))));
 
-        // Output side: subject_iri column + user columns.
+        // Output side: subject_iri column + user columns. Clone the
+        // outer subject/object Vars but drop the outer contextVar so
+        // the SERVICE body is graph-agnostic (its wf:call handler
+        // returns rows drawn from the shape sink, not from any named
+        // graph).
         body.add(sp(oVar.clone(),
                 constVar(VF.createIRI(WF_NS + shape.subjectColumnName())),
-                subjectVar.clone()));
+                dropContext(subjectVar.clone())));
         for (Map.Entry<String, Var> e : mappedColumns) {
             body.add(sp(oVar.clone(),
                     constVar(VF.createIRI(WF_NS + e.getKey())),
-                    e.getValue().clone()));
+                    dropContext(e.getValue().clone())));
         }
 
         final TupleExpr inner = joinAll(body);
@@ -327,7 +446,18 @@ public final class ShapeRewrite implements QueryOptimizer {
     }
 
     private static StatementPattern sp(final Var s, final Var p, final Var o) {
+        // Explicit constructor omits contextVar/scope, matching the
+        // default StatementPattern.Scope.DEFAULT_CONTEXTS &mdash; the
+        // SERVICE body doesn't participate in named-graph iteration.
         return new StatementPattern(s, p, o);
+    }
+
+    /** Clone-with-no-context: a fresh Var carrying only name/value. */
+    private static Var dropContext(final Var v) {
+        // Var.clone() preserves name, value, anonymous, constant flags
+        // — none of that references a graph context, so returning the
+        // clone as-is is correct. Kept as a named helper for clarity.
+        return v;
     }
 
     private static Var anonVar(final String name) {

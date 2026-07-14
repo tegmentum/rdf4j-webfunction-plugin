@@ -73,6 +73,23 @@ public final class ShapeRegistry {
         return byName.get(name);
     }
 
+    /**
+     * Look up a shape by its rdf:type IRI (anchor class). Used when a
+     * BGP contains only {@code ?s a <class>} &mdash; the shape rewrite
+     * can lift the BGP if a registered shape claims that anchor class.
+     * Returns the first matching shape (there is no ordering promise
+     * across shapes that share an anchor class; production usage
+     * shouldn't).
+     */
+    public ShapeEntry findByClass(final String iri) {
+        for (ShapeEntry e : byName.values()) {
+            if (iri.equals(e.anchorClass())) {
+                return e;
+            }
+        }
+        return null;
+    }
+
     public static ShapeRegistry loadFromSqlite(final Path dbPath, final String table) throws SQLException {
         final String url = "jdbc:sqlite:" + dbPath.toAbsolutePath();
         try (Connection conn = DriverManager.getConnection(url)) {
