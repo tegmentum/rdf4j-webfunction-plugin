@@ -582,6 +582,36 @@ public class TestWfFederationRewrite {
                 .contains("50");
     }
 
+    // ---------------------------------------------------------------------
+    // buildService — invalid endpoint IRI guard
+    //
+    // A SPARQL source whose `endpoint` string is empty or non-absolute
+    // (e.g. the `{{OXIGRAPH_URL}}` placeholder didn't get substituted
+    // because the case declined to spin up a mock endpoint) used to trip
+    // `VF.createIRI("")` with a cryptic `IllegalArgumentException: Not a
+    // valid (absolute) IRI:` at `buildService`. Guard it with a specific
+    // error that names the source so an operator can see which entry is
+    // at fault. Regression driver: `cases/federation_heterogeneous.toml`.
+    // ---------------------------------------------------------------------
+    @Test
+    public void emptySparqlEndpointThrowsWithSourceName() {
+        final FederationRegistry reg = FederationRegistry.of(List.of(
+                sparql("products", "", "http://ex/label")));
+        final InvokeRegistry inv = new InvokeRegistry();
+        final ParsedQuery pq = parse(
+                "SELECT ?p ?l WHERE { ?p <http://ex/label> ?l }");
+        final WfFederationRewrite rw = new WfFederationRewrite(reg, inv);
+        try {
+            rw.rewritePattern(pq.getTupleExpr());
+            org.junit.Assert.fail("expected IllegalStateException for empty endpoint");
+        } catch (IllegalStateException e) {
+            assertThat(e.getMessage())
+                    .as("error message must name the offending source")
+                    .contains("products")
+                    .contains("SPARQL");
+        }
+    }
+
     /**
      * Omitted {@code silent} on a wf-search source falls back to the
      * type-based default (false — substrate-local dispatch; failures

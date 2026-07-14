@@ -314,6 +314,21 @@ public final class WfFederationRewrite implements QueryOptimizer {
             body = new Join(body, sps.get(i).clone());
         }
         final String url = urlFor(source);
+        if (!isValidAbsoluteIri(url)) {
+            // Registry entries with an empty / unresolved / non-absolute
+            // endpoint (e.g. a SPARQL source whose `{{OXIGRAPH_URL}}`
+            // placeholder didn't substitute because the case declined to
+            // spin up a mock) would blow up inside `VF.createIRI(url)` with
+            // a cryptic `IllegalArgumentException: Not a valid (absolute)
+            // IRI:` (empty). Wrap the failure with the source name so the
+            // operator can see which registry entry is at fault — same
+            // guard the wf-search / wf-fetch URL folders use.
+            throw new IllegalStateException(String.format(
+                    "wf_federation: source `%s` (type=%s) has no valid absolute endpoint "
+                            + "IRI (got \"%s\"). Fix: point the source's `endpoint` at a "
+                            + "reachable URL, or drop the source from the registry.",
+                    source.name(), source.sourceType(), url));
+        }
         // Anonymous, constant Var carrying the SERVICE URL — matches how
         // RDF4J's parser materialises a `SERVICE <url>` ref (see
         // PartialRewrite / WfSearchRewrite for the same pattern).
@@ -329,6 +344,30 @@ public final class WfFederationRewrite implements QueryOptimizer {
         // rows — the whole federation-empty-bindings bug.
         return new Service(serviceRef, body, BgpSparqlRenderer.render(body),
                 new HashMap<>(), "", resolveSilent(source));
+    }
+
+    /**
+     * True when {@code url} would produce a valid absolute IRI at
+     * {@link SimpleValueFactory#createIRI(String)}. Absent, empty, or
+     * relative strings all fail — they trip the RDF4J value factory
+     * with a stack-trace-unfriendly {@code IllegalArgumentException:
+     * Not a valid (absolute) IRI:} that misses which registry entry
+     * actually caused the failure.
+     */
+    private static boolean isValidAbsoluteIri(final String url) {
+        if (url == null || url.isEmpty()) return false;
+        final int colon = url.indexOf(':');
+        if (colon <= 0) return false;
+        // Match RFC 3986 scheme = ALPHA *(ALPHA / DIGIT / "+" / "-" / ".").
+        // Cheap manual check — pulling in Apache HttpClient's URI parser
+        // just for this would be overkill.
+        for (int i = 0; i < colon; i++) {
+            final char c = url.charAt(i);
+            final boolean ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                    || (i > 0 && ((c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.'));
+            if (!ok) return false;
+        }
+        return true;
     }
 
     private static String urlFor(final FederationSource s) {
