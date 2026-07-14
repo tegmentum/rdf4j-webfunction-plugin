@@ -67,6 +67,19 @@ public final class FederationRegistry {
          * index on RDF4J.
          */
         WF_VECTOR,
+        /**
+         * Substrate {@code wf-relational:} URL sugar (wf-relational
+         * design memo &sect;04). {@link FederationSource#endpoint()}
+         * carries a {@code postgres://…/db} URL &mdash; Postgres is
+         * the only v0.1 backend. The federation pass emits
+         * {@code SERVICE <wf-relational:<name>>} and defers dispatch
+         * to {@code wf_fetch}, whose shape descriptor's
+         * {@code sink_kind = "postgres"} tells the guest to speak
+         * Postgres-SQL. RDF4J ships the registry plumbing in v0.1;
+         * end-to-end dispatch is gated on the host sink layer
+         * growing a Postgres backend (memo &sect;11 step 2).
+         */
+        WF_RELATIONAL,
         /** External SPARQL endpoint reached over HTTP. */
         HTTP_SPARQL
     }
@@ -205,11 +218,12 @@ public final class FederationRegistry {
             case "wf-fetch", "wf_fetch"       -> SourceType.WF_FETCH;
             case "wf-document", "wf_document" -> SourceType.WF_DOCUMENT;
             case "wf-vector", "wf_vector" -> SourceType.WF_VECTOR;
+            case "wf-relational", "wf_relational" -> SourceType.WF_RELATIONAL;
             case "http-sparql", "http_sparql" -> SourceType.HTTP_SPARQL;
             default -> throw new IllegalArgumentException(
                     "federation registry source `" + name + "`: unknown type `" + typeStr
                             + "` (expected `sparql`, `wf-search`, `wf-fetch`, `wf-document`, "
-                            + "`wf-vector`, or `http-sparql`)");
+                            + "`wf-vector`, `wf-relational`, or `http-sparql`)");
         };
         if (!raw.hasNonNull("endpoint")) {
             throw new IllegalArgumentException(

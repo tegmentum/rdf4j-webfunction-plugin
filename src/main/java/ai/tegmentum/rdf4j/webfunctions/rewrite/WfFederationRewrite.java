@@ -381,6 +381,11 @@ public final class WfFederationRewrite implements QueryOptimizer {
             // surface. On engines without a wf-vector-capable backend
             // registered separately this will error (wf-vector memo §10).
             case WF_VECTOR           -> "wf-vector:"   + s.name();
+            // wf_relational v0.1 — emit the URL sugar. RDF4J has no
+            // wf-relational-aware URL handler in v0.1; the emitted URL
+            // stays unfolded unless a wf-fetch dispatcher on the JVM
+            // side grows Postgres support (memo §04, §11 step 2).
+            case WF_RELATIONAL       -> "wf-relational:" + s.name();
         };
     }
 
@@ -408,7 +413,11 @@ public final class WfFederationRewrite implements QueryOptimizer {
 
     private static boolean defaultSilentFor(final SourceType type) {
         return switch (type) {
-            case SPARQL, HTTP_SPARQL -> true;
+            // wf_relational v0.1 defaults to silent per its own memo
+            // §09 — Postgres is a network endpoint; transport errors
+            // should degrade to empty bindings rather than fail the
+            // whole federated query.
+            case SPARQL, HTTP_SPARQL, WF_RELATIONAL -> true;
             // WF_VECTOR joins the substrate-local group (wf-vector memo
             // §09) — a KNN dispatch failure inside the embedded index
             // (or an unfolded wf-vector: URL on an engine that has no
