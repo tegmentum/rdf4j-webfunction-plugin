@@ -10,6 +10,9 @@ import org.eclipse.rdf4j.query.algebra.evaluation.EvaluationStrategy;
 import org.eclipse.rdf4j.query.algebra.evaluation.QueryEvaluationStep;
 import org.eclipse.rdf4j.query.algebra.evaluation.TripleSource;
 import org.eclipse.rdf4j.query.algebra.evaluation.impl.QueryEvaluationContext;
+import org.eclipse.rdf4j.query.parser.ParsedBooleanQuery;
+import org.eclipse.rdf4j.query.parser.ParsedGraphQuery;
+import org.eclipse.rdf4j.query.parser.ParsedQuery;
 import org.eclipse.rdf4j.query.parser.ParsedTupleQuery;
 import org.eclipse.rdf4j.query.parser.QueryParserUtil;
 
@@ -53,14 +56,32 @@ public final class CallbackContext {
     // responsible for closing whatever the guest didn't via sink-close.
     private final java.util.List<Sink> sinks = new java.util.ArrayList<>();
 
+    // Set true after the first successful executeUpdate commit on this
+    // context. Under MemoryStore snapshot isolation, the outer strategy's
+    // tripleSource still sees the pre-update snapshot after our fresh-
+    // connection commit lands, so any subsequent executeSelect / query
+    // must go through a fresh SailConnection to see the committed rows.
+    // This is the fix for the chained_pipeline verify_canonical
+    // 0-rows regression documented on that case's xfail_reason.
+    private boolean postUpdate = false;
+
     /**
      * A precompiled sub-query bound to this context's strategy. Holds the
      * {@link QueryEvaluationStep} so runPrepared() only pays initial-binding
      * substitution + iteration on each call.
+     *
+     * <p>The original {@code sparql} text is retained so that, post-update,
+     * runPrepared can reparse and evaluate through a fresh SailConnection
+     * (the cached step is bound to the outer strategy's pre-update
+     * tripleSource and would return stale rows).
      */
     private static final class Prepared {
         final QueryEvaluationStep step;
-        Prepared(final QueryEvaluationStep step) { this.step = step; }
+        final String sparql;
+        Prepared(final QueryEvaluationStep step, final String sparql) {
+            this.step = step;
+            this.sparql = sparql;
+        }
     }
 
     private CallbackContext(final EvaluationStrategy strategy,
@@ -161,32 +182,182 @@ public final class CallbackContext {
     }
 
     /**
-     * Execute a SPARQL SELECT/ASK/DESCRIBE query in the current query's
-     * evaluation context, with the given initial bindings pre-applied.
-     * Returns the lazy iterator of {@link BindingSet}s; caller closes it.
+     * Execute an arbitrary SPARQL query with the given initial bindings and
+     * return the resulting {@link BindingSet} iterator. Dispatches on query
+     * shape via {@link QueryParserUtil#parseQuery(QueryLanguage, String, String)}:
+     * <ul>
+     *   <li>{@link ParsedTupleQuery} (SELECT): precompile through the outer
+     *       strategy and evaluate — same tripleSource, same optimizations,
+     *       same transaction view.</li>
+     *   <li>{@link ParsedGraphQuery} (CONSTRUCT / DESCRIBE): precompile the
+     *       template's TupleExpr — which yields BindingSets with the
+     *       reserved vars {@code subject}, {@code predicate}, {@code object}
+     *       (see {@code SailGraphQuery$2}) — and remap those onto
+     *       {@code s}, {@code p}, {@code o} so the WIT envelope matches
+     *       Oxigraph's {@code QueryResults::Graph} shape from
+     *       {@code oxigraph-wf/src/host.rs}. Guests written to that shape
+     *       (e.g. {@code wf_infer}'s CONSTRUCT-and-INSERT loop) work
+     *       identically across substrates.</li>
+     *   <li>{@link ParsedBooleanQuery} (ASK): evaluate for at least one
+     *       row; return a single-row iteration with the pseudo-var
+     *       {@code _ask} bound to the boolean literal, mirroring
+     *       Oxigraph's {@code QueryResults::Boolean} shape.</li>
+     * </ul>
      *
-     * <p>The sub-query goes through the SAME {@link EvaluationStrategy} as
-     * the outer query, so it sees the same triple source, the same
-     * transaction view, the same optimizations, and — critically — can
-     * itself invoke wf callbacks recursively.
+     * <p>Method name kept as {@code executeSelect} for backward compatibility
+     * with existing host-callback wiring; it now handles the full query
+     * shape space, not just SELECT.
      *
-     * <p>Enforces the caller-supplied {@code maxRows} via a wrapping
-     * iterator: rows beyond that count are silently dropped. Fuel and
-     * memory limits are enforced by the surrounding wasm engine.
+     * <p>Post-update path: once {@link #executeUpdate(String, BindingSet)}
+     * has committed, the outer strategy's tripleSource still sees the
+     * pre-update snapshot under MemoryStore snapshot isolation, so
+     * evaluation is routed through a fresh SailConnection to see the
+     * committed rows. The returned iteration owns the connection and
+     * closes it when itself closed.
      */
     public CloseableIteration<BindingSet> executeSelect(final String sparql,
                                                         final BindingSet initialBindings) {
         try {
-            final ParsedTupleQuery parsed = QueryParserUtil.parseTupleQuery(
+            final ParsedQuery parsed = QueryParserUtil.parseQuery(
                     QueryLanguage.SPARQL, sparql, null);
-            final TupleExpr expr = parsed.getTupleExpr();
-            // Precompile through the strategy so any callback-installed
-            // optimizations (tuple-function rewrite, etc.) also apply here.
-            final QueryEvaluationStep step = strategy.precompile(
-                    expr, new QueryEvaluationContext.Minimal(parsed.getDataset()));
-            return step.evaluate(initialBindings);
+            if (parsed instanceof ParsedTupleQuery) {
+                return evaluateTupleExpr(parsed, initialBindings);
+            }
+            if (parsed instanceof ParsedGraphQuery) {
+                return remapSubjectPredicateObjectToSpo(
+                        evaluateTupleExpr(parsed, initialBindings));
+            }
+            if (parsed instanceof ParsedBooleanQuery) {
+                final boolean answer;
+                try (CloseableIteration<BindingSet> iter =
+                        evaluateTupleExpr(parsed, initialBindings)) {
+                    answer = iter.hasNext();
+                }
+                return askBooleanIteration(answer);
+            }
+            throw new RuntimeException(
+                "wf callback: unsupported SPARQL query shape (parsed as "
+                + parsed.getClass().getSimpleName() + ")");
         } catch (MalformedQueryException e) {
             throw new RuntimeException("wf callback: SPARQL parse error: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Evaluate a parsed query's {@link TupleExpr} either via the outer
+     * strategy (fast path, reuses tripleSource + strategy optimizations)
+     * or via a fresh {@link org.eclipse.rdf4j.sail.SailConnection}
+     * (correctness path — post-update, see {@link #postUpdate}).
+     *
+     * <p>Fresh-connection path opens a {@link org.eclipse.rdf4j.sail.SailConnection}
+     * on {@link #sail}, evaluates through it, and wraps the returned
+     * iteration so closing it also closes the connection. The wrapper is
+     * necessary because the iteration is lazy — closing the connection
+     * before the caller drains it would break iteration.
+     */
+    private CloseableIteration<BindingSet> evaluateTupleExpr(
+            final ParsedQuery parsed, final BindingSet initialBindings) {
+        if (postUpdate) {
+            if (sail == null) {
+                throw new IllegalStateException(
+                    "wf callback: post-update read needs a Sail — construct "
+                    + "WfEvaluationStrategyFactory with the two-arg overload");
+            }
+            final org.eclipse.rdf4j.sail.SailConnection conn = sail.getConnection();
+            try {
+                final CloseableIteration<? extends BindingSet> inner = conn.evaluate(
+                        parsed.getTupleExpr(),
+                        parsed.getDataset(),
+                        initialBindings,
+                        true);
+                return new ConnectionClosingIteration(inner, conn);
+            } catch (RuntimeException | Error re) {
+                conn.close();
+                throw re;
+            }
+        }
+        // Fast path: precompile through the strategy so any callback-
+        // installed optimizations (tuple-function rewrite, etc.) also
+        // apply here.
+        final QueryEvaluationStep step = strategy.precompile(
+                parsed.getTupleExpr(),
+                new QueryEvaluationContext.Minimal(parsed.getDataset()));
+        return step.evaluate(initialBindings);
+    }
+
+    /**
+     * Wrap a graph-query iteration (BindingSets with reserved vars
+     * {@code subject}, {@code predicate}, {@code object}, optionally
+     * {@code context}) into one with the SPO shape guests expect
+     * cross-substrate ({@code s}, {@code p}, {@code o}).
+     */
+    private static CloseableIteration<BindingSet> remapSubjectPredicateObjectToSpo(
+            final CloseableIteration<BindingSet> inner) {
+        return new CloseableIteration<BindingSet>() {
+            @Override public boolean hasNext() { return inner.hasNext(); }
+            @Override public BindingSet next() {
+                final BindingSet row = inner.next();
+                final org.eclipse.rdf4j.query.impl.MapBindingSet out =
+                        new org.eclipse.rdf4j.query.impl.MapBindingSet();
+                final org.eclipse.rdf4j.model.Value s = row.getValue("subject");
+                final org.eclipse.rdf4j.model.Value p = row.getValue("predicate");
+                final org.eclipse.rdf4j.model.Value o = row.getValue("object");
+                if (s != null) out.addBinding("s", s);
+                if (p != null) out.addBinding("p", p);
+                if (o != null) out.addBinding("o", o);
+                return out;
+            }
+            @Override public void remove() { inner.remove(); }
+            @Override public void close() { inner.close(); }
+        };
+    }
+
+    /**
+     * Materialise an ASK answer as a single-row iteration with pseudo-var
+     * {@code _ask} bound to an {@code xsd:boolean} literal — mirroring
+     * Oxigraph's {@code QueryResults::Boolean} shape so guests get the
+     * same binding-sets envelope across substrates.
+     */
+    private CloseableIteration<BindingSet> askBooleanIteration(final boolean answer) {
+        final org.eclipse.rdf4j.model.Literal lit =
+                tripleSource.getValueFactory().createLiteral(answer);
+        final org.eclipse.rdf4j.query.impl.MapBindingSet row =
+                new org.eclipse.rdf4j.query.impl.MapBindingSet();
+        row.addBinding("_ask", lit);
+        final java.util.Iterator<BindingSet> it = java.util.List.<BindingSet>of(row).iterator();
+        return new CloseableIteration<BindingSet>() {
+            @Override public boolean hasNext() { return it.hasNext(); }
+            @Override public BindingSet next() { return it.next(); }
+            @Override public void remove() { throw new UnsupportedOperationException(); }
+            @Override public void close() { /* nothing to release */ }
+        };
+    }
+
+    /**
+     * Wraps a lazy iteration produced by a per-callback SailConnection so
+     * that closing the outer iteration also closes the connection —
+     * necessary for the {@link #postUpdate} fresh-connection path where
+     * we can't leak the connection past the caller's try-with-resources
+     * on the iteration.
+     */
+    private static final class ConnectionClosingIteration
+            implements CloseableIteration<BindingSet> {
+        private final CloseableIteration<? extends BindingSet> inner;
+        private final org.eclipse.rdf4j.sail.SailConnection conn;
+        private boolean closed = false;
+        ConnectionClosingIteration(
+                final CloseableIteration<? extends BindingSet> inner,
+                final org.eclipse.rdf4j.sail.SailConnection conn) {
+            this.inner = inner;
+            this.conn = conn;
+        }
+        @Override public boolean hasNext() { return inner.hasNext(); }
+        @Override public BindingSet next() { return inner.next(); }
+        @Override public void remove() { inner.remove(); }
+        @Override public void close() {
+            if (closed) return;
+            closed = true;
+            try { inner.close(); } finally { conn.close(); }
         }
     }
 
@@ -216,6 +387,25 @@ public final class CallbackContext {
                 bsa.setBindingNames(new java.util.LinkedHashSet<>(seedVars));
                 bsa.setBindingSets(seedRows);
                 expr = spliceValuesUnderProjection(expr, bsa);
+            }
+            // Post-update: use a fresh connection so we see committed rows,
+            // mirroring executeSelect's rationale.
+            if (postUpdate) {
+                if (sail == null) {
+                    throw new IllegalStateException(
+                        "wf callback: post-update read needs a Sail");
+                }
+                final org.eclipse.rdf4j.sail.SailConnection conn = sail.getConnection();
+                try {
+                    final CloseableIteration<? extends BindingSet> inner = conn.evaluate(
+                            expr, parsed.getDataset(),
+                            new org.eclipse.rdf4j.query.impl.EmptyBindingSet(),
+                            true);
+                    return new ConnectionClosingIteration(inner, conn);
+                } catch (RuntimeException | Error re) {
+                    conn.close();
+                    throw re;
+                }
             }
             final QueryEvaluationStep step = strategy.precompile(
                     expr, new QueryEvaluationContext.Minimal(parsed.getDataset()));
@@ -288,7 +478,7 @@ public final class CallbackContext {
                     parsed.getTupleExpr(),
                     new QueryEvaluationContext.Minimal(parsed.getDataset()));
             final int h = nextHandle++;
-            prepared.put(h, new Prepared(step));
+            prepared.put(h, new Prepared(step, sparql));
             return h;
         } catch (MalformedQueryException e) {
             throw new RuntimeException("wf callback: SPARQL parse error: " + e.getMessage(), e);
@@ -313,6 +503,23 @@ public final class CallbackContext {
                 "wf callback: follow-predicate predicate must be IRI");
         }
         final java.util.List<org.eclipse.rdf4j.model.Value> out = new java.util.ArrayList<>();
+        // Post-update, tripleSource holds the pre-commit snapshot; open a
+        // fresh SailConnection so we see rows the outer wf:call frame
+        // just committed via execute-update.
+        if (postUpdate && sail != null) {
+            try (org.eclipse.rdf4j.sail.SailConnection conn = sail.getConnection();
+                 CloseableIteration<? extends org.eclipse.rdf4j.model.Statement> it =
+                        conn.getStatements(
+                                (org.eclipse.rdf4j.model.Resource) subject,
+                                (org.eclipse.rdf4j.model.IRI) predicate,
+                                null,
+                                true)) {
+                while (it.hasNext()) {
+                    out.add(it.next().getObject());
+                }
+            }
+            return out;
+        }
         try (CloseableIteration<? extends org.eclipse.rdf4j.model.Statement> it =
                 tripleSource.getStatements(
                         (org.eclipse.rdf4j.model.Resource) subject,
@@ -326,12 +533,21 @@ public final class CallbackContext {
     }
 
     /** v0.3.2 run-prepared — evaluate a handle from {@link #prepare} with
-     *  fresh initial bindings. */
+     *  fresh initial bindings.
+     *
+     *  <p>Post-update, the cached step is bound to the outer strategy's
+     *  pre-update tripleSource and would return stale rows; instead we
+     *  reparse the stored SPARQL text and evaluate through
+     *  {@link #executeSelect} (which routes to a fresh SailConnection).
+     */
     public CloseableIteration<BindingSet> runPrepared(final int handle,
                                                      final BindingSet initialBindings) {
         final Prepared p = prepared.get(handle);
         if (p == null) {
             throw new RuntimeException("wf callback: unknown prepared handle " + handle);
+        }
+        if (postUpdate) {
+            return executeSelect(p.sparql, initialBindings);
         }
         return p.step.evaluate(initialBindings);
     }
@@ -394,6 +610,15 @@ public final class CallbackContext {
      * (MemoryStore uses snapshot isolation, so the read view won't see the
      * write until the read closes).
      *
+     * <p>After a successful commit, {@link #postUpdate} is set so
+     * subsequent callback reads ({@link #executeSelect},
+     * {@link #executeSelectWithBindings}, {@link #runPrepared},
+     * {@link #followPredicate}) route through a fresh SailConnection and
+     * observe the just-written rows — otherwise they'd continue to read
+     * the outer strategy's stale snapshot and, e.g., chained_pipeline's
+     * verify_canonical would report 0 rows for the write the previous
+     * step just committed.
+     *
      * <p>When the factory was constructed without a Sail (the pre-existing
      * one-arg constructor), throws {@link IllegalStateException} — the
      * caller returns err to the guest.
@@ -423,6 +648,10 @@ public final class CallbackContext {
                             -1);    // maxExecutionTime
                 }
                 sc.commit();
+                // Flip AFTER a successful commit — a rolled-back update
+                // shouldn't force subsequent reads onto the fresh-conn
+                // path if nothing landed on the store.
+                postUpdate = true;
             } catch (RuntimeException | Error re) {
                 sc.rollback();
                 throw re;
