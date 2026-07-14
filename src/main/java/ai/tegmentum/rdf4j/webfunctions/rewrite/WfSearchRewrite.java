@@ -268,19 +268,37 @@ public final class WfSearchRewrite implements QueryOptimizer {
             rewrites++;
         }
 
+        /**
+         * Allocate an {@code InvokeSpec} for the wf_document guest. Arg
+         * positions match the {@code search} export as declared in
+         * {@code wf-document.wit} (world {@code document}, v1.3):
+         *
+         * <ol start="0">
+         *   <li>{@code search_backend} — Manticore endpoint from the entry.</li>
+         *   <li>{@code storage_backend} — sirix-sql-server endpoint.</li>
+         *   <li>{@code index} — Manticore-side table name (entry's
+         *       {@code search_index}).</li>
+         *   <li>{@code query} — search string from the SERVICE body's
+         *       {@code wf:query "…"} triple.</li>
+         *   <li>{@code opts_json} — URL opts (highlight, lang, filter,
+         *       offset, include_body, limit) merged with
+         *       {@code at_time}/{@code at_rev} from the URL time-spec.
+         *       {@code limit} lives inside this record per the WIT
+         *       ({@code search-opts.limit: option<u32>}); a default is
+         *       always emitted by {@link #buildOptsJson}.</li>
+         * </ol>
+         */
         private String allocateDocumentInvoke(final DocumentRegistry.DocumentIndex entry,
                                               final ParsedUrl parsed,
                                               final String query,
                                               final Map<String, String> projection,
                                               final boolean projectsSnippet) {
-            final int limit = parseLimit(parsed.opts, DEFAULT_LIMIT);
             final String optsJson = buildOptsJson(parsed.timeSpec, parsed.opts, projectsSnippet);
-            final List<Value> args = new ArrayList<>(6);
+            final List<Value> args = new ArrayList<>(5);
             args.add(VF.createLiteral(entry.searchBackend()));
             args.add(VF.createLiteral(entry.storageBackend()));
             args.add(VF.createLiteral(entry.searchIndex()));
             args.add(VF.createLiteral(query));
-            args.add(VF.createLiteral(limit));
             args.add(VF.createLiteral(optsJson));
             final long id = invokes.insert(
                     new InvokeSpec(entry.guestUrl(), args, "search", projection));
@@ -633,12 +651,15 @@ public final class WfSearchRewrite implements QueryOptimizer {
     }
 
     /**
-     * Build the opts JSON that the guest sees. Only the memo-declared
-     * keys pass through ({@code highlight}, {@code lang}, {@code filter},
-     * {@code offset}, {@code include_body}, {@code after}, {@code before});
-     * {@code limit} is a separate positional arg so it's stripped here.
-     * The time-spec is baked into {@code at_time} (ISO-8601) or
-     * {@code at_rev} (numeric). The v1.3 range keys ({@code after} /
+     * Build the opts JSON that the guest sees — the JSON encoding of
+     * the wf_document {@code search-opts} WIT record. Memo-declared
+     * keys pass through ({@code limit}, {@code highlight}, {@code lang},
+     * {@code filter}, {@code offset}, {@code include_body},
+     * {@code after}, {@code before}); {@code limit} lives inside this
+     * record per the WIT ({@code search-opts.limit: option<u32>}) and
+     * gets a {@link #DEFAULT_LIMIT} fallback when the URL sugar didn't
+     * set one. The time-spec is baked into {@code at_time} (ISO-8601)
+     * or {@code at_rev} (numeric). The v1.3 range keys ({@code after} /
      * {@code before}) are verbatim string pass-through — the guest owns
      * range interpretation.
      *
@@ -678,7 +699,21 @@ public final class WfSearchRewrite implements QueryOptimizer {
             final String v = e.getValue();
             switch (k) {
                 case "limit" -> {
-                    // Positional arg — already peeled off.
+                    // wf_document WIT declares `limit` inside
+                    // `search-opts` (option<u32>). Emit into opts_json
+                    // so the guest's typed-record decoder sees it.
+                    try {
+                        final long lim = Long.parseLong(v);
+                        if (lim >= 0) {
+                            if (!first) sb.append(',');
+                            sb.append("\"limit\":").append(lim);
+                            first = false;
+                        }
+                    } catch (NumberFormatException ignored) {
+                        // Malformed — silently drop; a DEFAULT_LIMIT
+                        // fallback is injected below when no valid
+                        // limit landed in the JSON.
+                    }
                 }
                 case "highlight", "include_body" -> {
                     if (!first) sb.append(',');
@@ -720,6 +755,16 @@ public final class WfSearchRewrite implements QueryOptimizer {
         if (projectsSnippet && !opts.containsKey("highlight")) {
             if (!first) sb.append(',');
             sb.append("\"highlight\":true");
+            first = false;
+        }
+
+        // wf_document WIT declares `limit` inside `search-opts`. Inject
+        // a default when the URL sugar didn't set one (or it was
+        // malformed and dropped above) so callers get bounded results
+        // without having to append `?limit=N` to every request.
+        if (parseLimit(opts, -1) < 0) {
+            if (!first) sb.append(',');
+            sb.append("\"limit\":").append(DEFAULT_LIMIT);
             first = false;
         }
 

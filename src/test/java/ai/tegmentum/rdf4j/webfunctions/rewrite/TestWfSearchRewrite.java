@@ -114,7 +114,10 @@ public class TestWfSearchRewrite {
         return ((Literal) spec.args().get(i)).intValue();
     }
     private static String queryArg(final InvokeSpec spec) { return stringLit(spec, 3); }
-    private static String optsArg(final InvokeSpec spec) { return stringLit(spec, 5); }
+    // args = [searchBackend, storageBackend, index, query, optsJson] per
+    // the wf_document `search` export WIT signature. `limit` lives inside
+    // optsJson (search-opts.limit: option<u32>).
+    private static String optsArg(final InvokeSpec spec) { return stringLit(spec, 4); }
 
     // ---------------------------------------------------------------------
     // URL parser tests
@@ -234,13 +237,15 @@ public class TestWfSearchRewrite {
         assertThat(hasWfSearchService(pq.getTupleExpr())).isFalse();
 
         final InvokeSpec spec = takeFirstInvoke(inv);
-        // arg order: searchBackend, storageBackend, index, query, limit, optsJson
+        // arg order: searchBackend, storageBackend, index, query, optsJson.
+        // limit lives inside optsJson per the WIT record shape.
         assertThat(stringLit(spec, 0)).isEqualTo("http://localhost:9308");
         assertThat(stringLit(spec, 1)).isEqualTo("http://localhost:8080");
         assertThat(stringLit(spec, 2)).isEqualTo("manuals");
         assertThat(queryArg(spec)).isEqualTo("waterproof");
-        assertThat(intLit(spec, 4)).isEqualTo(10); // DEFAULT_LIMIT
-        assertThat(optsArg(spec)).isEqualTo("{}");
+        // Bare URL — no user opts — opts_json carries only the injected
+        // default `limit` (DEFAULT_LIMIT).
+        assertThat(optsArg(spec)).isEqualTo("{\"limit\":10}");
         assertThat(spec.entryPoint()).isEqualTo("search");
         assertThat(spec.wasmUrl()).isEqualTo("file:///opt/wf_document.wasm");
     }
@@ -307,7 +312,9 @@ public class TestWfSearchRewrite {
         assertThat(hasWfInvokeService(pq.getTupleExpr())).isTrue();
 
         final InvokeSpec spec = takeFirstInvoke(inv);
-        assertThat(optsArg(spec)).isEqualTo("{\"at_rev\":17}");
+        // limit fallback is emitted after at_rev when the URL didn't
+        // supply a limit — order matches buildOptsJson's insertion.
+        assertThat(optsArg(spec)).isEqualTo("{\"at_rev\":17,\"limit\":10}");
     }
 
     // ---------------------------------------------------------------------
@@ -561,7 +568,7 @@ public class TestWfSearchRewrite {
                 .isEqualTo("file:///opt/wf_document.wasm");
         assertThat(spec.args())
                 .as("wf_document ABI expected, not wf_fulltext")
-                .hasSize(6);
+                .hasSize(5);
     }
 
     @Test
