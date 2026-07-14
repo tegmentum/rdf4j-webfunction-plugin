@@ -96,6 +96,13 @@ public final class WfSearchRewrite implements QueryOptimizer {
     /** wf namespace and the {@code wf:query} predicate that carries the search string. */
     private static final String WF_NS = "http://tegmentum.ai/ns/webfunction/";
     private static final String WF_QUERY = WF_NS + "query";
+    /**
+     * Guest-emitted column the SERVICE body binds via
+     * {@code ?_ wf:snippet ?var}. Its presence in the collected output
+     * projection drives the memo §10 smart-set of
+     * {@code highlight: true} on the emitted opts JSON.
+     */
+    private static final String WF_SNIPPET_COL = "snippet";
 
     /**
      * Default result cap when the URL doesn't specify {@code limit}.
@@ -184,12 +191,20 @@ public final class WfSearchRewrite implements QueryOptimizer {
             final Map<String, String> projection =
                     collectOutputProjection(service.getServiceExpr());
 
+            // Memo §10 smart-set flag. `wf:snippet` in the body signals
+            // the caller expects the snippet cell populated — set
+            // `highlight: true` in the emitted opts JSON unless the
+            // URL sugar explicitly overrode it. Cheap lookup on the
+            // projection map keyed by guest column.
+            final boolean projectsSnippet = projection.containsKey(WF_SNIPPET_COL);
+
             // Primary path: DocumentRegistry (wf_document guest ABI).
             final DocumentRegistry.DocumentIndex docEntry =
                     registry == null ? null : registry.byName(parsed.name);
             final String invokeIri;
             if (docEntry != null) {
-                invokeIri = allocateDocumentInvoke(docEntry, parsed, query, projection);
+                invokeIri = allocateDocumentInvoke(
+                        docEntry, parsed, query, projection, projectsSnippet);
             } else {
                 // Fallback: FulltextRegistry (wf_fulltext guest ABI).
                 // Enables federation sources whose dispatch info lives
@@ -197,7 +212,8 @@ public final class WfSearchRewrite implements QueryOptimizer {
                 final FulltextRegistry.FulltextIndex ftEntry =
                         fulltextRegistry == null ? null : fulltextRegistry.byName(parsed.name);
                 if (ftEntry == null) return; // unregistered — leave alone
-                invokeIri = allocateFulltextInvoke(ftEntry, parsed, query, projection);
+                invokeIri = allocateFulltextInvoke(
+                        ftEntry, parsed, query, projection, projectsSnippet);
             }
 
             // Swap the serviceRef Var for one bound to wf-invoke:<hex>. RDF4J
@@ -216,9 +232,10 @@ public final class WfSearchRewrite implements QueryOptimizer {
         private String allocateDocumentInvoke(final DocumentRegistry.DocumentIndex entry,
                                               final ParsedUrl parsed,
                                               final String query,
-                                              final Map<String, String> projection) {
+                                              final Map<String, String> projection,
+                                              final boolean projectsSnippet) {
             final int limit = parseLimit(parsed.opts, DEFAULT_LIMIT);
-            final String optsJson = buildOptsJson(parsed.timeSpec, parsed.opts);
+            final String optsJson = buildOptsJson(parsed.timeSpec, parsed.opts, projectsSnippet);
             final List<Value> args = new ArrayList<>(6);
             args.add(VF.createLiteral(entry.searchBackend()));
             args.add(VF.createLiteral(entry.storageBackend()));
@@ -242,13 +259,15 @@ public final class WfSearchRewrite implements QueryOptimizer {
         private String allocateFulltextInvoke(final FulltextRegistry.FulltextIndex entry,
                                               final ParsedUrl parsed,
                                               final String query,
-                                              final Map<String, String> projection) {
+                                              final Map<String, String> projection,
+                                              final boolean projectsSnippet) {
             // wf_fulltext guest's `query-opts` WIT record has two
             // REQUIRED fields — `fields: list<string>` and
             // `highlight: bool`. Emit both as defaults; otherwise the
             // substrate's typed-arg marshaller fails with
             // "record missing required field `fields`".
-            final String optsJson = buildFulltextOptsJson(parsed.timeSpec, parsed.opts);
+            final String optsJson = buildFulltextOptsJson(
+                    parsed.timeSpec, parsed.opts, projectsSnippet);
             final String[] be = splitFulltextOpts(entry);
             final List<Value> args = new ArrayList<>(4);
             args.add(VF.createLiteral(be[0])); // backend_endpoint
@@ -263,15 +282,28 @@ public final class WfSearchRewrite implements QueryOptimizer {
         /**
          * Build JSON matching the wf_fulltext guest's {@code query-opts}
          * WIT record. {@code fields} and {@code highlight} are required.
+         *
+         * <p>{@code projectsSnippet} implements memo §10: when the
+         * SERVICE body projects a variable through {@code wf:snippet},
+         * the substrate defaults {@code highlight} to true so callers
+         * don't have to append {@code ?highlight=true} to the URL.
+         * An explicit URL opt still wins — the URL value is checked
+         * first and only when unset does the smart-set fall through.
          */
         private static String buildFulltextOptsJson(final String timeSpec,
-                                                    final Map<String, String> opts) {
+                                                    final Map<String, String> opts,
+                                                    final boolean projectsSnippet) {
             final StringBuilder sb = new StringBuilder();
             sb.append('{');
             sb.append("\"fields\":[]");
             final String hl = opts.get("highlight");
-            sb.append(",\"highlight\":")
-                    .append("true".equalsIgnoreCase(hl) || "1".equals(hl) ? "true" : "false");
+            final boolean highlight;
+            if (hl == null || hl.isEmpty()) {
+                highlight = projectsSnippet;
+            } else {
+                highlight = "true".equalsIgnoreCase(hl) || "1".equals(hl);
+            }
+            sb.append(",\"highlight\":").append(highlight ? "true" : "false");
             appendOptInt(sb, opts.get("limit"), "limit");
             appendOptInt(sb, opts.get("offset"), "offset");
             appendOptStr(sb, opts.get("lang"), "lang");
@@ -501,8 +533,16 @@ public final class WfSearchRewrite implements QueryOptimizer {
      * {@code at_rev} (numeric). The v1.3 range keys ({@code after} /
      * {@code before}) are verbatim string pass-through — the guest owns
      * range interpretation.
+     *
+     * <p>{@code projectsSnippet} implements memo §10: when the SERVICE
+     * body projects a variable through {@code wf:snippet} AND the URL
+     * sugar didn't set {@code highlight}, emit {@code "highlight":true}.
+     * An explicit URL opt wins because the switch below handles the
+     * URL case first — the smart-set fallback only fires when no
+     * highlight key was seen in the URL opts.
      */
-    private static String buildOptsJson(final String timeSpec, final Map<String, String> opts) {
+    private static String buildOptsJson(final String timeSpec, final Map<String, String> opts,
+                                        final boolean projectsSnippet) {
         final StringBuilder sb = new StringBuilder();
         sb.append('{');
         boolean first = true;
@@ -561,6 +601,18 @@ public final class WfSearchRewrite implements QueryOptimizer {
                     // rather than a rewrite failure.
                 }
             }
+        }
+
+        // Memo §10 smart-set: SERVICE body projected `wf:snippet` and
+        // the URL didn't say anything about `highlight` — inject the
+        // default. `opts.containsKey("highlight")` guards against
+        // clobbering an explicit URL opt (which was handled above by
+        // the switch). Only emit when true; a false smart-set would
+        // pollute the emitted JSON without changing guest behavior.
+        if (projectsSnippet && !opts.containsKey("highlight")) {
+            if (!first) sb.append(',');
+            sb.append("\"highlight\":true");
+            first = false;
         }
 
         sb.append('}');
