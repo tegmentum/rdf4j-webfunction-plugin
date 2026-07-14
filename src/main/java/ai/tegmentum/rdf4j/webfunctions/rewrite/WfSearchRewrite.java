@@ -198,8 +198,20 @@ public final class WfSearchRewrite implements QueryOptimizer {
             final ParsedUrl parsed = parseUrl(url);
             if (parsed == null) return; // missing name — skip
 
-            final String query = extractWfQuery(service.getServiceExpr());
-            if (query == null) return; // no wf:query triple — skip
+            String query = extractWfQuery(service.getServiceExpr());
+            if (query == null) {
+                // Body-triple form is absent — fall back to the
+                // URL-parameter sugar `?query=<term>` for the
+                // federation_heterogeneous shape where the SERVICE URL
+                // carries the search string instead of a triple.
+                // `opts.remove` strips the key so it doesn't leak into
+                // the emitted opts_json (buildOptsJson iterates a
+                // whitelist that already ignores unknown keys, but
+                // removing here keeps ownership local). Mirrors the
+                // Jena sibling (`WfSearchRewrite.java:209`).
+                query = parsed.opts.remove("query");
+                if (query == null || query.isEmpty()) return;
+            }
 
             // Walk the SERVICE body ONCE at rewrite time to derive the
             // (guest_col -> outer_var) projection map from every
@@ -746,15 +758,28 @@ public final class WfSearchRewrite implements QueryOptimizer {
             }
         }
 
-        // Memo §10 smart-set: SERVICE body projected `wf:snippet` and
-        // the URL didn't say anything about `highlight` — inject the
-        // default. `opts.containsKey("highlight")` guards against
-        // clobbering an explicit URL opt (which was handled above by
-        // the switch). Only emit when true; a false smart-set would
-        // pollute the emitted JSON without changing guest behavior.
-        if (projectsSnippet && !opts.containsKey("highlight")) {
+        // WIT-required defaults on the wf_document `search-opts` record
+        // (`wf-document.wit` v1.3): `fields: list<string>` and
+        // `highlight: bool` are non-option — the substrate must emit
+        // both or the guest's typed-record decoder fails with
+        // "record missing required field `fields`" before the call
+        // reaches the guest. Mirrors the identical fix already applied
+        // to the wf_fulltext `query-opts` record in buildFulltextOptsJson.
+        // (parseUrl does not accept a `fields` opt so the
+        // containsKey guard is defensive future-proofing.)
+        if (!opts.containsKey("fields")) {
             if (!first) sb.append(',');
-            sb.append("\"highlight\":true");
+            sb.append("\"fields\":[]");
+            first = false;
+        }
+        // Highlight: URL `?highlight=` was already appended above by the
+        // switch. When absent, emit projectsSnippet as the default —
+        // memo §10 smart-set on the `true` side, WIT-required-field
+        // satisfaction on the `false` side (previously omitted when the
+        // body didn't project wf:snippet).
+        if (!opts.containsKey("highlight")) {
+            if (!first) sb.append(',');
+            sb.append("\"highlight\":").append(projectsSnippet ? "true" : "false");
             first = false;
         }
 

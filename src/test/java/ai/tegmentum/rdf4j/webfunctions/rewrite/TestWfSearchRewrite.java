@@ -243,9 +243,11 @@ public class TestWfSearchRewrite {
         assertThat(stringLit(spec, 1)).isEqualTo("http://localhost:8080");
         assertThat(stringLit(spec, 2)).isEqualTo("manuals");
         assertThat(queryArg(spec)).isEqualTo("waterproof");
-        // Bare URL — no user opts — opts_json carries only the injected
-        // default `limit` (DEFAULT_LIMIT).
-        assertThat(optsArg(spec)).isEqualTo("{\"limit\":10}");
+        // Bare URL — no user opts — opts_json carries the WIT-required
+        // `fields:[]` and `highlight:false` defaults plus the injected
+        // `limit` fallback. StringBuilder emission order is `fields`,
+        // `highlight`, `limit`, so the exact JSON is stable.
+        assertThat(optsArg(spec)).isEqualTo("{\"fields\":[],\"highlight\":false,\"limit\":10}");
         assertThat(spec.entryPoint()).isEqualTo("search");
         assertThat(spec.wasmUrl()).isEqualTo("file:///opt/wf_document.wasm");
     }
@@ -312,9 +314,11 @@ public class TestWfSearchRewrite {
         assertThat(hasWfInvokeService(pq.getTupleExpr())).isTrue();
 
         final InvokeSpec spec = takeFirstInvoke(inv);
-        // limit fallback is emitted after at_rev when the URL didn't
-        // supply a limit — order matches buildOptsJson's insertion.
-        assertThat(optsArg(spec)).isEqualTo("{\"at_rev\":17,\"limit\":10}");
+        // Emission order matches buildOptsJson's insertion: `at_rev`
+        // first (from the timeSpec branch), then the WIT-required
+        // defaults `fields:[]` / `highlight:false`, then the injected
+        // `limit` fallback.
+        assertThat(optsArg(spec)).isEqualTo("{\"at_rev\":17,\"fields\":[],\"highlight\":false,\"limit\":10}");
     }
 
     // ---------------------------------------------------------------------
@@ -385,7 +389,11 @@ public class TestWfSearchRewrite {
 
     @Test
     public void noSmartSetWhenBodyOmitsSnippet() {
-        // No wf:snippet in the body → highlight key stays absent.
+        // No wf:snippet in the body → substrate emits the WIT-required
+        // `highlight:false` default. Pre-v1.3 behavior was to omit the
+        // key entirely and let the guest pick a default; the WIT now
+        // declares `highlight: bool` as non-option, so the substrate
+        // must always emit it.
         final DocumentRegistry reg = manualsRegistry();
         final InvokeRegistry inv = new InvokeRegistry();
         final ParsedQuery pq = parse(""
@@ -399,8 +407,99 @@ public class TestWfSearchRewrite {
         assertThat(rw.rewritePattern(pq.getTupleExpr())).isEqualTo(1);
         final InvokeSpec spec = takeFirstInvoke(inv);
         assertThat(optsArg(spec))
-                .as("no wf:snippet must leave highlight unset")
-                .doesNotContain("\"highlight\"");
+                .as("no wf:snippet must emit WIT-required highlight=false default")
+                .contains("\"highlight\":false")
+                .doesNotContain("\"highlight\":true");
+    }
+
+    @Test
+    public void optsJsonIncludesRequiredWitFields() {
+        // The wf_document WIT `search-opts` record declares `fields:
+        // list<string>` and `highlight: bool` as non-optional (memo §04,
+        // `wf-document.wit` v1.3). The substrate coercer errors out on
+        // a missing required field before the dispatch reaches the
+        // guest ("arg 4 of `search`: record missing required field
+        // `fields`"), so every wf_document opts_json emission must
+        // include both. Parallel guard to the wf_fulltext test of the
+        // same name.
+        final DocumentRegistry reg = manualsRegistry();
+        final InvokeRegistry inv = new InvokeRegistry();
+        final ParsedQuery pq = parse(""
+                + "PREFIX wf: <http://tegmentum.ai/ns/webfunction/>\n"
+                + "SELECT ?doc WHERE {\n"
+                + "  SERVICE <wf-search:manuals> {\n"
+                + "    ?_ wf:query \"waterproof\" ; wf:doc ?doc\n"
+                + "  }\n"
+                + "}");
+        final WfSearchRewrite rw = new WfSearchRewrite(reg, inv);
+        assertThat(rw.rewritePattern(pq.getTupleExpr())).isEqualTo(1);
+        final InvokeSpec spec = takeFirstInvoke(inv);
+        assertThat(optsArg(spec))
+                .as("opts_json must include the WIT-required `fields` and `highlight` defaults")
+                .contains("\"fields\":[]")
+                .contains("\"highlight\":false");
+    }
+
+    // ---------------------------------------------------------------------
+    // URL-parameter query sugar (federation_heterogeneous shape)
+    // ---------------------------------------------------------------------
+
+    @Test
+    public void foldsViaUrlQueryOptWhenBodyMissingWfQuery() {
+        // federation_heterogeneous.toml shape: SERVICE body has no
+        // `wf:query "…"` triple; the search string travels in the URL
+        // as `?query=<term>`. The rewrite pass must fall back to the
+        // URL opt so the SERVICE folds into `wf-invoke:<hex>` instead
+        // of surviving to the default dispatcher. Mirrors Jena's
+        // `urlQueryParamFoldsWithoutBodyTriple`.
+        final DocumentRegistry reg = manualsRegistry();
+        final InvokeRegistry inv = new InvokeRegistry();
+        final ParsedQuery pq = parse(""
+                + "PREFIX wf: <http://tegmentum.ai/ns/webfunction/>\n"
+                + "SELECT ?doc WHERE {\n"
+                + "  SERVICE <wf-search:manuals?query=waterproof> {\n"
+                + "    ?_ wf:doc ?doc\n"
+                + "  }\n"
+                + "}");
+        final WfSearchRewrite rw = new WfSearchRewrite(reg, inv);
+        assertThat(rw.rewritePattern(pq.getTupleExpr()))
+                .as("URL ?query= must fold without a wf:query body triple")
+                .isEqualTo(1);
+        assertThat(hasWfInvokeService(pq.getTupleExpr())).isTrue();
+
+        final InvokeSpec spec = takeFirstInvoke(inv);
+        assertThat(queryArg(spec))
+                .as("positional arg 3 is the URL query opt")
+                .isEqualTo("waterproof");
+        // `query` must NOT leak into opts_json — the guest reads the
+        // query from the positional arg, not from the opts record.
+        assertThat(optsArg(spec))
+                .as("query opt must be consumed positionally, not leak into opts_json")
+                .doesNotContain("\"query\"");
+    }
+
+    @Test
+    public void bodyWfQueryWinsOverUrlQueryOpt() {
+        // When both a body `wf:query "…"` triple AND a URL `?query=<term>`
+        // opt are present, the body-triple form wins — it is closer to
+        // the caller's intent than a URL string decorated by federation
+        // config. Mirrors Jena's `bodyWfQueryWinsOverUrlQueryParam`.
+        final DocumentRegistry reg = manualsRegistry();
+        final InvokeRegistry inv = new InvokeRegistry();
+        final ParsedQuery pq = parse(""
+                + "PREFIX wf: <http://tegmentum.ai/ns/webfunction/>\n"
+                + "SELECT ?doc WHERE {\n"
+                + "  SERVICE <wf-search:manuals?query=urlterm> {\n"
+                + "    ?_ wf:query \"bodyterm\" ; wf:doc ?doc\n"
+                + "  }\n"
+                + "}");
+        final WfSearchRewrite rw = new WfSearchRewrite(reg, inv);
+        assertThat(rw.rewritePattern(pq.getTupleExpr())).isEqualTo(1);
+
+        final InvokeSpec spec = takeFirstInvoke(inv);
+        assertThat(queryArg(spec))
+                .as("body wf:query literal must win over URL ?query= opt")
+                .isEqualTo("bodyterm");
     }
 
     @Test
