@@ -152,14 +152,18 @@ public final class RewritePipeline {
         // whether to fold any surrounding BGP.
         // WfSearchRewrite consults BOTH DocumentRegistry (primary,
         // wf_document guest ABI) and FulltextRegistry (fallback,
-        // wf_fulltext guest ABI). Enabled when either registry has an
-        // entry: a federation source may declare `wf-search:<name>` sugar
-        // whose dispatch info lives only in --fulltext-config.
+        // wf_fulltext guest ABI). It additionally consults
+        // FederationRegistry as a third fallback so `wf-search:<name>`
+        // URLs registered ONLY as a federation source of type wf-search
+        // (the federation_heterogeneous shape) still fold. Enabled when
+        // any of the three registries has an entry.
         final boolean anyWfSearchSource =
                 (documentRegistry != null && !documentRegistry.isEmpty())
-                        || (fulltextRegistry != null && !fulltextRegistry.isEmpty());
+                        || (fulltextRegistry != null && !fulltextRegistry.isEmpty())
+                        || (federationRegistry != null && !federationRegistry.isEmpty());
         if (anyWfSearchSource && invokeRegistry != null) {
-            out.add(new WfSearchRewrite(documentRegistry, fulltextRegistry, invokeRegistry));
+            out.add(new WfSearchRewrite(documentRegistry, fulltextRegistry,
+                    federationRegistry, invokeRegistry));
         }
         // WfFetchRewrite runs between WfSearchRewrite and ShapeRewrite.
         // Folds SERVICE <wf-fetch:<name>> (emitted by WfFederationRewrite

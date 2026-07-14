@@ -113,11 +113,12 @@ public final class WfSearchRewrite implements QueryOptimizer {
 
     private final DocumentRegistry registry;
     private final FulltextRegistry fulltextRegistry;
+    private final FederationRegistry federationRegistry;
     private final InvokeRegistry invokes;
     private int rewrites;
 
     public WfSearchRewrite(final DocumentRegistry registry, final InvokeRegistry invokes) {
-        this(registry, null, invokes);
+        this(registry, null, null, invokes);
     }
 
     /**
@@ -132,8 +133,29 @@ public final class WfSearchRewrite implements QueryOptimizer {
     public WfSearchRewrite(final DocumentRegistry registry,
                            final FulltextRegistry fulltextRegistry,
                            final InvokeRegistry invokes) {
+        this(registry, fulltextRegistry, null, invokes);
+    }
+
+    /**
+     * Three-registry constructor. Adds FederationRegistry as a third
+     * fallback so a {@code wf-search:<name>} URL registered ONLY as a
+     * federation source of {@code type = "wf-search"} (no matching
+     * fulltext / document entry — the {@code federation_heterogeneous}
+     * shape) still folds. The federation entry has no dispatch info
+     * of its own, so the pass synthesizes the wf_fulltext-shaped
+     * InvokeSpec: backend endpoint from the entry's
+     * {@code endpoint()} when HTTP-shaped, else {@code $MANTICORE_URL}
+     * (fallback {@code http://localhost:9308}); wasm URL from
+     * {@code $WF_FULLTEXT_WASM_URL} (fallback the well-known convention
+     * {@code file:///opt/wf_fulltext.wasm}).
+     */
+    public WfSearchRewrite(final DocumentRegistry registry,
+                           final FulltextRegistry fulltextRegistry,
+                           final FederationRegistry federationRegistry,
+                           final InvokeRegistry invokes) {
         this.registry = registry;
         this.fulltextRegistry = fulltextRegistry;
+        this.federationRegistry = federationRegistry;
         this.invokes = invokes;
     }
 
@@ -144,9 +166,10 @@ public final class WfSearchRewrite implements QueryOptimizer {
     public void optimize(final TupleExpr tupleExpr, final Dataset dataset, final BindingSet bindings) {
         rewrites = 0;
         if (invokes == null) return;
-        final boolean bothEmpty = (registry == null || registry.isEmpty())
-                && (fulltextRegistry == null || fulltextRegistry.isEmpty());
-        if (bothEmpty) return;
+        final boolean allEmpty = (registry == null || registry.isEmpty())
+                && (fulltextRegistry == null || fulltextRegistry.isEmpty())
+                && (federationRegistry == null || federationRegistry.isEmpty());
+        if (allEmpty) return;
         tupleExpr.visit(new Walker());
     }
 
@@ -211,9 +234,25 @@ public final class WfSearchRewrite implements QueryOptimizer {
                 // in --fulltext-config.
                 final FulltextRegistry.FulltextIndex ftEntry =
                         fulltextRegistry == null ? null : fulltextRegistry.byName(parsed.name);
-                if (ftEntry == null) return; // unregistered — leave alone
-                invokeIri = allocateFulltextInvoke(
-                        ftEntry, parsed, query, projection, projectsSnippet);
+                if (ftEntry != null) {
+                    invokeIri = allocateFulltextInvoke(
+                            ftEntry, parsed, query, projection, projectsSnippet);
+                } else {
+                    // Fallback: FederationRegistry (wf_fulltext guest ABI
+                    // with synthesized dispatch info). Enables the
+                    // federation_heterogeneous shape where the source is
+                    // declared ONLY under --federation-config with no
+                    // matching fulltext / document entry.
+                    final FederationRegistry.FederationSource fedEntry =
+                            federationRegistry == null ? null
+                                    : federationRegistry.byName(parsed.name);
+                    if (fedEntry == null
+                            || fedEntry.sourceType() != FederationRegistry.SourceType.WF_SEARCH) {
+                        return; // unregistered / wrong type — leave alone
+                    }
+                    invokeIri = allocateFederationWfSearchInvoke(
+                            fedEntry, parsed, query, projection, projectsSnippet);
+                }
             }
 
             // Swap the serviceRef Var for one bound to wf-invoke:<hex>. RDF4J
@@ -246,6 +285,75 @@ public final class WfSearchRewrite implements QueryOptimizer {
             final long id = invokes.insert(
                     new InvokeSpec(entry.guestUrl(), args, "search", projection));
             return InvokeRegistry.iriFor(id);
+        }
+
+        /**
+         * FederationRegistry-backed fallback allocator. Emits an
+         * InvokeSpec against the same wf_fulltext guest ABI as
+         * {@link #allocateFulltextInvoke}, but the FederationSource
+         * carries no dispatch info of its own, so:
+         *
+         * <ul>
+         *   <li>{@code backend_endpoint}: {@code entry.endpoint()} when
+         *       HTTP-shaped, otherwise {@code $MANTICORE_URL} (test
+         *       harness convention) or Manticore's default port.</li>
+         *   <li>{@code index}: {@code entry.name()} — federation entries
+         *       don't declare an alias.</li>
+         *   <li>wasm URL: {@code $WF_FULLTEXT_WASM_URL} or the well-known
+         *       convention {@code file:///opt/wf_fulltext.wasm}. Missing
+         *       wasm surfaces at dispatch time with a clear error
+         *       rather than at plan time as the current "unsupported
+         *       SERVICE URI" rejection.</li>
+         * </ul>
+         */
+        private String allocateFederationWfSearchInvoke(
+                final FederationRegistry.FederationSource entry,
+                final ParsedUrl parsed,
+                final String query,
+                final Map<String, String> projection,
+                final boolean projectsSnippet) {
+            final String optsJson = buildFulltextOptsJson(
+                    parsed.timeSpec, parsed.opts, projectsSnippet);
+            final String backendEndpoint = federationBackendEndpoint(entry);
+            final String wasmUrl = federationWasmUrl();
+            final List<Value> args = new ArrayList<>(4);
+            args.add(VF.createLiteral(backendEndpoint));
+            args.add(VF.createLiteral(entry.name())); // index
+            args.add(VF.createLiteral(query));
+            args.add(VF.createLiteral(optsJson));
+            final long id = invokes.insert(
+                    new InvokeSpec(wasmUrl, args, "search", projection));
+            return InvokeRegistry.iriFor(id);
+        }
+
+        /**
+         * Choose the wf_fulltext {@code backend_endpoint} positional
+         * arg for a FederationSource. HTTP-shaped entry endpoints pass
+         * through verbatim; anything else (typically
+         * {@code wf-search:<name>} self-refs) falls through to
+         * {@code $MANTICORE_URL} or Manticore's default.
+         */
+        private static String federationBackendEndpoint(
+                final FederationRegistry.FederationSource entry) {
+            final String ep = entry.endpoint();
+            if (ep != null && (ep.startsWith("http://") || ep.startsWith("https://"))) {
+                return ep;
+            }
+            final String env = System.getenv("MANTICORE_URL");
+            if (env != null && !env.isEmpty()) return env;
+            return "http://localhost:9308";
+        }
+
+        /**
+         * Resolve the wf_fulltext.wasm URL for the federation fallback.
+         * Prefers the {@code WF_FULLTEXT_WASM_URL} env var; falls back
+         * to the well-known convention path so a runtime dispatch
+         * failure has a distinctive, actionable error surface.
+         */
+        private static String federationWasmUrl() {
+            final String env = System.getenv("WF_FULLTEXT_WASM_URL");
+            if (env != null && !env.isEmpty()) return env;
+            return "file:///opt/wf_fulltext.wasm";
         }
 
         /**

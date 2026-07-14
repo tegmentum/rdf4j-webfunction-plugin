@@ -436,4 +436,158 @@ public class TestWfSearchRewrite {
         // Sanity: the SERVICE clause survives untouched.
         assertThat(collectServices(pq.getTupleExpr())).hasSize(1);
     }
+
+    // ---------------------------------------------------------------------
+    // FederationRegistry fallback (wave-3 federation_heterogeneous)
+    // ---------------------------------------------------------------------
+
+    /**
+     * Federation registry with a single wf-search source named
+     * `manuals-search` and a self-referential endpoint — mirrors the
+     * shape {@code federation_heterogeneous.toml} seeds via
+     * {@code --federation-config}.
+     */
+    private static FederationRegistry manualsFederationRegistry() {
+        return FederationRegistry.of(List.of(new FederationRegistry.FederationSource(
+                "manuals-search",
+                FederationRegistry.SourceType.WF_SEARCH,
+                "wf-search:manuals-search",
+                List.of(),
+                OptionalInt.empty())));
+    }
+
+    /**
+     * Federation registry whose wf-search source declares a real HTTP
+     * endpoint — exercises the passthrough branch of
+     * {@code federationBackendEndpoint}.
+     */
+    private static FederationRegistry manualsFederationRegistryHttp() {
+        return FederationRegistry.of(List.of(new FederationRegistry.FederationSource(
+                "manuals-search",
+                FederationRegistry.SourceType.WF_SEARCH,
+                "http://manticore.internal:9309",
+                List.of(),
+                OptionalInt.empty())));
+    }
+
+    @Test
+    public void foldsViaFederationRegistryWhenOthersMiss() {
+        // Neither DocumentRegistry nor FulltextRegistry knows the name;
+        // only FederationRegistry has a wf-search entry. The pass must
+        // still fold using a synthesized wf_fulltext InvokeSpec.
+        final DocumentRegistry docReg = DocumentRegistry.empty();
+        final FulltextRegistry ftReg = FulltextRegistry.empty();
+        final FederationRegistry fedReg = manualsFederationRegistry();
+        final InvokeRegistry inv = new InvokeRegistry();
+        final ParsedQuery pq = parse(""
+                + "PREFIX wf: <http://tegmentum.ai/ns/webfunction/>\n"
+                + "SELECT ?m ?snippet WHERE {\n"
+                + "  SERVICE <wf-search:manuals-search> {\n"
+                + "    ?_ wf:query \"waterproof\" ; wf:doc ?m ; wf:snippet ?snippet\n"
+                + "  }\n"
+                + "}");
+        final WfSearchRewrite rw = new WfSearchRewrite(docReg, ftReg, fedReg, inv);
+        assertThat(rw.rewritePattern(pq.getTupleExpr()))
+                .as("federation fallback must fold the SERVICE")
+                .isEqualTo(1);
+        assertThat(hasWfInvokeService(pq.getTupleExpr())).isTrue();
+        assertThat(hasWfSearchService(pq.getTupleExpr())).isFalse();
+
+        final InvokeSpec spec = takeFirstInvoke(inv);
+        assertThat(spec.entryPoint()).isEqualTo("search");
+        // wf_fulltext ABI: [backend_endpoint, index, query, opts_json]
+        assertThat(spec.args()).hasSize(4);
+        assertThat(((Literal) spec.args().get(1)).getLabel())
+                .as("index should be entry name")
+                .isEqualTo("manuals-search");
+        assertThat(((Literal) spec.args().get(2)).getLabel()).isEqualTo("waterproof");
+        assertThat(((Literal) spec.args().get(3)).getLabel())
+                .as("wf:snippet in body must smart-set highlight=true")
+                .contains("\"highlight\":true");
+    }
+
+    @Test
+    public void foldsViaFederationRegistryHonoursHttpEndpoint() {
+        // A federation wf-search entry with a real HTTP endpoint must
+        // pass through as the wf_fulltext backend_endpoint arg
+        // verbatim, not fall through to the Manticore default.
+        final FederationRegistry fedReg = manualsFederationRegistryHttp();
+        final InvokeRegistry inv = new InvokeRegistry();
+        final ParsedQuery pq = parse(""
+                + "PREFIX wf: <http://tegmentum.ai/ns/webfunction/>\n"
+                + "SELECT ?m WHERE {\n"
+                + "  SERVICE <wf-search:manuals-search> {\n"
+                + "    ?_ wf:query \"waterproof\" ; wf:doc ?m\n"
+                + "  }\n"
+                + "}");
+        final WfSearchRewrite rw = new WfSearchRewrite(
+                DocumentRegistry.empty(), FulltextRegistry.empty(), fedReg, inv);
+        assertThat(rw.rewritePattern(pq.getTupleExpr())).isEqualTo(1);
+
+        final InvokeSpec spec = takeFirstInvoke(inv);
+        assertThat(((Literal) spec.args().get(0)).getLabel())
+                .as("HTTP-shaped federation endpoint must pass through verbatim")
+                .isEqualTo("http://manticore.internal:9309");
+    }
+
+    @Test
+    public void documentRegistryWinsOverFederation() {
+        // Precedence: Document > Fulltext > Federation. The document
+        // registry's wf_document ABI wins over a federation
+        // fallback's synthesized wf_fulltext shape.
+        final DocumentRegistry docReg = manualsRegistry();
+        final FederationRegistry fedReg = FederationRegistry.of(List.of(
+                new FederationRegistry.FederationSource(
+                        "manuals",
+                        FederationRegistry.SourceType.WF_SEARCH,
+                        "http://manticore.internal:9309",
+                        List.of(),
+                        OptionalInt.empty())));
+        final InvokeRegistry inv = new InvokeRegistry();
+        final ParsedQuery pq = parse(""
+                + "PREFIX wf: <http://tegmentum.ai/ns/webfunction/>\n"
+                + "SELECT ?doc WHERE {\n"
+                + "  SERVICE <wf-search:manuals> {\n"
+                + "    ?_ wf:query \"waterproof\" ; wf:doc ?doc\n"
+                + "  }\n"
+                + "}");
+        final WfSearchRewrite rw = new WfSearchRewrite(
+                docReg, FulltextRegistry.empty(), fedReg, inv);
+        assertThat(rw.rewritePattern(pq.getTupleExpr())).isEqualTo(1);
+
+        final InvokeSpec spec = takeFirstInvoke(inv);
+        assertThat(spec.wasmUrl())
+                .as("DocumentRegistry entry wins over the federation fallback")
+                .isEqualTo("file:///opt/wf_document.wasm");
+        assertThat(spec.args())
+                .as("wf_document ABI expected, not wf_fulltext")
+                .hasSize(6);
+    }
+
+    @Test
+    public void federationWrongTypeIsSkipped() {
+        // A non-wf-search federation entry must not fold as a search
+        // source. The SERVICE is left alone.
+        final FederationRegistry fedReg = FederationRegistry.of(List.of(
+                new FederationRegistry.FederationSource(
+                        "manuals-search",
+                        FederationRegistry.SourceType.WF_FETCH,
+                        "wf-fetch:manuals-search",
+                        List.of(),
+                        OptionalInt.empty())));
+        final InvokeRegistry inv = new InvokeRegistry();
+        final ParsedQuery pq = parse(""
+                + "PREFIX wf: <http://tegmentum.ai/ns/webfunction/>\n"
+                + "SELECT ?m WHERE {\n"
+                + "  SERVICE <wf-search:manuals-search> {\n"
+                + "    ?_ wf:query \"waterproof\" ; wf:doc ?m\n"
+                + "  }\n"
+                + "}");
+        final WfSearchRewrite rw = new WfSearchRewrite(
+                DocumentRegistry.empty(), FulltextRegistry.empty(), fedReg, inv);
+        assertThat(rw.rewritePattern(pq.getTupleExpr()))
+                .as("wf-fetch federation source must not fold as wf-search")
+                .isZero();
+        assertThat(hasWfSearchService(pq.getTupleExpr())).isTrue();
+    }
 }
