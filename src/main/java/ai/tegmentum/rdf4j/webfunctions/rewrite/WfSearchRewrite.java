@@ -171,12 +171,25 @@ public final class WfSearchRewrite implements QueryOptimizer {
             final String query = extractWfQuery(service.getServiceExpr());
             if (query == null) return; // no wf:query triple — skip
 
+            // Walk the SERVICE body ONCE at rewrite time to derive the
+            // (guest_col -> outer_var) projection map from every
+            // `?_ wf:<col> ?var` triple. This map has to be captured
+            // BEFORE RDF4J's dispatch inlines the outer-visible ?var
+            // as a constant into the SERVICE body — a body-walk at
+            // execution time (in WfInvokeService) silently misses the
+            // now-substituted triples, which collapses the outer join
+            // to a Cartesian product on the shared variable
+            // (federation_wf_search regression). Mirrors QLever's fix
+            // (`qlever-wf-runtime::wf_search_rewrite` commit `04fdb03`).
+            final Map<String, String> projection =
+                    collectOutputProjection(service.getServiceExpr());
+
             // Primary path: DocumentRegistry (wf_document guest ABI).
             final DocumentRegistry.DocumentIndex docEntry =
                     registry == null ? null : registry.byName(parsed.name);
             final String invokeIri;
             if (docEntry != null) {
-                invokeIri = allocateDocumentInvoke(docEntry, parsed, query);
+                invokeIri = allocateDocumentInvoke(docEntry, parsed, query, projection);
             } else {
                 // Fallback: FulltextRegistry (wf_fulltext guest ABI).
                 // Enables federation sources whose dispatch info lives
@@ -184,7 +197,7 @@ public final class WfSearchRewrite implements QueryOptimizer {
                 final FulltextRegistry.FulltextIndex ftEntry =
                         fulltextRegistry == null ? null : fulltextRegistry.byName(parsed.name);
                 if (ftEntry == null) return; // unregistered — leave alone
-                invokeIri = allocateFulltextInvoke(ftEntry, parsed, query);
+                invokeIri = allocateFulltextInvoke(ftEntry, parsed, query, projection);
             }
 
             // Swap the serviceRef Var for one bound to wf-invoke:<hex>. RDF4J
@@ -202,7 +215,8 @@ public final class WfSearchRewrite implements QueryOptimizer {
 
         private String allocateDocumentInvoke(final DocumentRegistry.DocumentIndex entry,
                                               final ParsedUrl parsed,
-                                              final String query) {
+                                              final String query,
+                                              final Map<String, String> projection) {
             final int limit = parseLimit(parsed.opts, DEFAULT_LIMIT);
             final String optsJson = buildOptsJson(parsed.timeSpec, parsed.opts);
             final List<Value> args = new ArrayList<>(6);
@@ -212,7 +226,8 @@ public final class WfSearchRewrite implements QueryOptimizer {
             args.add(VF.createLiteral(query));
             args.add(VF.createLiteral(limit));
             args.add(VF.createLiteral(optsJson));
-            final long id = invokes.insert(new InvokeSpec(entry.guestUrl(), args, "search"));
+            final long id = invokes.insert(
+                    new InvokeSpec(entry.guestUrl(), args, "search", projection));
             return InvokeRegistry.iriFor(id);
         }
 
@@ -226,7 +241,8 @@ public final class WfSearchRewrite implements QueryOptimizer {
          */
         private String allocateFulltextInvoke(final FulltextRegistry.FulltextIndex entry,
                                               final ParsedUrl parsed,
-                                              final String query) {
+                                              final String query,
+                                              final Map<String, String> projection) {
             // wf_fulltext guest's `query-opts` WIT record has two
             // REQUIRED fields — `fields: list<string>` and
             // `highlight: bool`. Emit both as defaults; otherwise the
@@ -239,7 +255,8 @@ public final class WfSearchRewrite implements QueryOptimizer {
             args.add(VF.createLiteral(be[1])); // index
             args.add(VF.createLiteral(query));
             args.add(VF.createLiteral(optsJson));
-            final long id = invokes.insert(new InvokeSpec(entry.backendUrl(), args, "search"));
+            final long id = invokes.insert(
+                    new InvokeSpec(entry.backendUrl(), args, "search", projection));
             return InvokeRegistry.iriFor(id);
         }
 
@@ -400,6 +417,45 @@ public final class WfSearchRewrite implements QueryOptimizer {
     // ---------------------------------------------------------------------
     // SERVICE body inspection
     // ---------------------------------------------------------------------
+
+    /**
+     * Walk the SERVICE body and collect every {@code ?_ wf:<col> ?var}
+     * triple as a (guest_col -> outer_var) rename entry. Java analogue
+     * of {@code qlever-wf-runtime::partial_rewrite::collect_output_projection}
+     * (commit `04fdb03`).
+     *
+     * <p>Called at rewrite time so the map is captured BEFORE RDF4J
+     * inlines outer-visible variables into the SERVICE body at
+     * dispatch time. The wf-invoke SERVICE dispatcher
+     * ({@link ai.tegmentum.rdf4j.webfunctions.WfInvokeService}) consumes
+     * the map from {@link InvokeSpec#projection()} to rename the
+     * wasm-emitted columns onto the outer-query variables the caller
+     * declared.
+     *
+     * <p>Skips config-side predicates ({@code wf:wasm}, {@code wf:arg},
+     * {@code wf:call}, {@code wf:query}) — none of them carry an
+     * output-column rename.
+     */
+    private static Map<String, String> collectOutputProjection(final TupleExpr body) {
+        final Map<String, String> out = new LinkedHashMap<>();
+        if (body == null) return out;
+        for (StatementPattern sp : StatementPatternCollector.process(body)) {
+            final Var p = sp.getPredicateVar();
+            if (p == null || !p.hasValue()) continue;
+            if (!(p.getValue() instanceof IRI predIri)) continue;
+            final String pUri = predIri.stringValue();
+            if (!pUri.startsWith(WF_NS)) continue;
+            final String col = pUri.substring(WF_NS.length());
+            if ("wasm".equals(col) || "arg".equals(col)
+                    || "call".equals(col) || "query".equals(col)) {
+                continue;
+            }
+            final Var o = sp.getObjectVar();
+            if (o == null || o.hasValue()) continue;
+            out.put(col, o.getName());
+        }
+        return out;
+    }
 
     /**
      * Walk the SERVICE body via {@link StatementPatternCollector} and

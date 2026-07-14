@@ -89,8 +89,7 @@ public final class WfInvokeService implements FederatedService {
             final Set<String> projectionVars,
             final BindingSet parent,
             final String baseUri) {
-        final Map<String, String> outputVarByColumn = parseOutputColumns(service.getServiceExpr());
-        return evaluateOne(outputVarByColumn, parent);
+        return evaluateOne(resolveOutputColumns(service), parent);
     }
 
     @Override
@@ -98,7 +97,7 @@ public final class WfInvokeService implements FederatedService {
             final Service service,
             final CloseableIteration<BindingSet> bindings,
             final String baseUri) {
-        final Map<String, String> outputVarByColumn = parseOutputColumns(service.getServiceExpr());
+        final Map<String, String> outputVarByColumn = resolveOutputColumns(service);
         final List<BindingSet> out = new ArrayList<>();
         try {
             while (bindings.hasNext()) {
@@ -113,6 +112,25 @@ public final class WfInvokeService implements FederatedService {
             bindings.close();
         }
         return new CloseableIteratorIteration<>(out.iterator());
+    }
+
+    /**
+     * Prefer the rewrite-time projection map stashed on
+     * {@link InvokeSpec#projection()} — that was captured BEFORE RDF4J
+     * inlined the outer-visible {@code ?var} into the SERVICE body's
+     * {@code wf:doc ?var} triples. Walking {@code service.getServiceExpr()}
+     * at dispatch time silently loses those (now-constant) triples,
+     * which collapses the outer join to a Cartesian product on the
+     * shared variable (federation_wf_search regression). The fallback
+     * still fires for legacy callers (e.g. wf:partial folds) whose
+     * InvokeSpec has no projection.
+     */
+    private Map<String, String> resolveOutputColumns(final Service service) {
+        final InvokeSpec probe = registry.peek(id);
+        if (probe != null && !probe.projection().isEmpty()) {
+            return probe.projection();
+        }
+        return parseOutputColumns(service.getServiceExpr());
     }
 
     private CloseableIteration<BindingSet> evaluateOne(final Map<String, String> outputVarByColumn,
@@ -148,6 +166,7 @@ public final class WfInvokeService implements FederatedService {
         }
 
         final List<BindingSet> out = new ArrayList<>(rows.size());
+        rows:
         for (WitValueMarshaller.Row row : rows) {
             final MapBindingSet mbs = new MapBindingSet();
             // Preserve outer bindings so downstream operators still see them.
@@ -157,14 +176,38 @@ public final class WfInvokeService implements FederatedService {
                 // every wasm-returned column verbatim under its wasm name.
                 for (int i = 0; i < row.vars.size(); i++) {
                     final Value v = row.values.get(i);
-                    if (v != null) mbs.addBinding(row.vars.get(i), v);
+                    if (v == null) continue;
+                    final String name = row.vars.get(i);
+                    final Value existing = parent.getValue(name);
+                    if (existing != null) {
+                        // SPARQL join semantics: drop rows whose guest
+                        // column disagrees with an outer binding that
+                        // already claimed the same variable name. The
+                        // wasm side never saw the outer binding, so we
+                        // finish the join here.
+                        if (!existing.equals(v)) continue rows;
+                    } else {
+                        mbs.addBinding(name, v);
+                    }
                 }
             } else {
                 for (Map.Entry<String, String> e : outputVarByColumn.entrySet()) {
                     final int idx = row.vars.indexOf(e.getKey());
                     if (idx < 0) continue;
                     final Value v = row.values.get(idx);
-                    if (v != null) mbs.addBinding(e.getValue(), v);
+                    if (v == null) continue;
+                    final String outerVar = e.getValue();
+                    final Value existing = parent.getValue(outerVar);
+                    if (existing != null) {
+                        // See note above — enforce the shared-variable
+                        // compat merge here. The wasm-emitted column
+                        // was renamed at rewrite time onto the outer
+                        // variable; if the outer already bound it, the
+                        // join filters mismatches.
+                        if (!existing.equals(v)) continue rows;
+                    } else {
+                        mbs.addBinding(outerVar, v);
+                    }
                 }
             }
             out.add(mbs);
