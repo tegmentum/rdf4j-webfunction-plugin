@@ -10,6 +10,7 @@ import org.eclipse.rdf4j.query.algebra.Filter;
 import org.eclipse.rdf4j.query.algebra.Join;
 import org.eclipse.rdf4j.query.algebra.Or;
 import org.eclipse.rdf4j.query.algebra.QueryModelNode;
+import org.eclipse.rdf4j.query.algebra.Service;
 import org.eclipse.rdf4j.query.algebra.StatementPattern;
 import org.eclipse.rdf4j.query.algebra.TupleExpr;
 import org.eclipse.rdf4j.query.algebra.ValueConstant;
@@ -81,11 +82,48 @@ final class BgpSparqlRenderer {
             out.append("FILTER(");
             renderCondition(f.getCondition(), out);
             out.append(") ");
+        } else if (node instanceof Service s) {
+            // A nested SERVICE inside an outer SERVICE body. Emitted by
+            // WfVectorRewrite when it wraps `SERVICE <wf-vector:…>` in
+            // `SERVICE <http://oxigraph-vector/query>` — the outer
+            // SPARQLFederatedService POSTs this rendered form to the
+            // remote Oxigraph, which then folds the inner clause via
+            // its own wf_vector_rewrite. Nested SERVICE bodies are the
+            // only Service shape this renderer sees in v0.2.
+            renderService(s, out);
         } else {
             throw new UnsupportedOperationException(
                     "BgpSparqlRenderer: unsupported node under Service body: "
                             + node.getClass().getName());
         }
+    }
+
+    /**
+     * Render a nested {@link Service} clause as SPARQL:
+     * {@code SERVICE [SILENT] <iri> { <body> } }. The service ref must be
+     * a constant IRI (the WfVectorRewrite path always synthesizes one);
+     * variable-ref Services (SPARQL 1.1 {@code SERVICE ?ref}) reach here
+     * only via a caller-authored query and are rejected loudly so a
+     * mistake in the outer rewrite pass surfaces instead of silently
+     * shipping an unbound ref.
+     */
+    private static void renderService(final Service s, final StringBuilder out) {
+        final Var ref = s.getServiceRef();
+        if (ref == null || !ref.hasValue()) {
+            throw new UnsupportedOperationException(
+                    "BgpSparqlRenderer: SERVICE ref must be a constant IRI, got var: "
+                            + (ref == null ? "null" : ref.getName()));
+        }
+        out.append("SERVICE ");
+        if (s.isSilent()) {
+            out.append("SILENT ");
+        }
+        renderValue(ref.getValue(), out);
+        out.append(" { ");
+        // The inner body renders through the same recursive dispatch —
+        // BGPs / Filters / further nested Services all supported.
+        renderExpr(s.getServiceExpr(), out);
+        out.append("} ");
     }
 
     private static void renderStatementPattern(final StatementPattern sp, final StringBuilder out) {

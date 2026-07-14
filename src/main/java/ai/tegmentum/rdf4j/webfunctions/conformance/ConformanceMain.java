@@ -190,7 +190,9 @@ public final class ConformanceMain {
         // clause reaches evaluation (which the ShapeRewrite pass always
         // installs).
         final WfServiceResolver resolver =
-                new WfServiceResolver(new SPARQLServiceResolver(), pipeline.invokeRegistry());
+                new WfServiceResolver(new SPARQLServiceResolver(),
+                        pipeline.invokeRegistry(),
+                        pipeline.federationRegistry());
         store.setEvaluationStrategyFactory(new WfEvaluationStrategyFactory(resolver, store, pipeline));
 
         final SailRepository repo = new SailRepository(store);

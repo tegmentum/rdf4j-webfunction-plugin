@@ -137,6 +137,18 @@ public final class RewritePipeline {
         if (fulltextRegistry != null && !fulltextRegistry.isEmpty() && invokeRegistry != null) {
             out.add(new FulltextRewrite(fulltextRegistry, invokeRegistry));
         }
+        // wf-vector federation dispatch (memo `wf-vector.md` §07.1) is
+        // NOT wired as a plan-time rewrite on RDF4J — the class
+        // WfVectorRewrite exists for reference / potential future use,
+        // but RDF4J's Service.parseServiceExpression strips any outer
+        // SERVICE wrap this pass tried to emit (regex-based `SERVICE
+        // <…> {…}` unwrap), which drops the KNN dispatch on the wire.
+        // Instead, the dispatch happens at the FederatedServiceResolver
+        // layer via `WfVectorFederatedService`: the `wf-vector:` scheme
+        // is recognised by `WfServiceResolver`, which looks up the name
+        // in the FederationRegistry and returns a handler that POSTs the
+        // whole SERVICE clause to the remote Oxigraph endpoint. See
+        // `WfServiceResolver.getService` for the wf-vector branch.
         // WfFederationRewrite runs after Alias (so aliased predicate IRIs
         // are canonicalised before the source-selection lookup) and
         // BEFORE WfSearchRewrite (which expands the wf-search:/wf-fetch:/
