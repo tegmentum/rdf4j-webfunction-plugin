@@ -335,19 +335,138 @@ public final class Rdf4jWasmInstance implements Closeable {
                         == ai.tegmentum.wasmtime4j.component.ComponentType.LIST) {
             return new Object[] { WitValueMarshaller.toWitArgs(args) };
         }
-        if (params.size() != args.length) {
+        // Positional-limit fold: mirrors oxigraph-wf's
+        // `maybe_fold_positional_limit` and Jena's counterpart. An
+        // explicit `wf:partial(<WASM>, ..., <limit>, <opts_json>)`
+        // callsite ships one more positional arg than a guest whose
+        // trailing param is an opts record where `limit` lives inside
+        // that record (wf_document `search-opts`). Merge the positional
+        // into the trailing JSON before validating arg counts so both
+        // callsite shapes reach the guest with the same 5-arg vector.
+        final Value[] foldedArgs = maybeFoldPositionalLimit(params, args);
+        if (params.size() != foldedArgs.length) {
             throw new IOException("arg count mismatch for `" + entry + "`: guest expects "
-                    + params.size() + " positional params, callsite supplied " + args.length);
+                    + params.size() + " positional params, callsite supplied " + foldedArgs.length);
         }
         final Object[] out = new Object[params.size()];
         for (int i = 0; i < params.size(); i++) {
             try {
-                out[i] = coerceValueToWit(args[i], params.get(i).type());
+                out[i] = coerceValueToWit(foldedArgs[i], params.get(i).type());
             } catch (RuntimeException e) {
                 throw new IOException("arg " + i + " of `" + entry + "`: " + e.getMessage(), e);
             }
         }
         return out;
+    }
+
+    /**
+     * Detect the `wf:partial(..., <limit>, <opts_json>)` callsite that
+     * supplies one more positional arg than the guest's typed signature
+     * declares, and fold the extra scalar into the trailing opts record
+     * so the marshaller can proceed with the guest's canonical shape.
+     * Mirrors {@code oxigraph-wf/src/wf_call.rs::maybe_fold_positional_limit}
+     * and Jena's {@code JenaWasmInstance.maybeFoldPositionalLimit}.
+     */
+    static Value[] maybeFoldPositionalLimit(
+            final List<ai.tegmentum.wasmtime4j.component.ComponentItemInfo.NamedType> params,
+            final Value[] args) {
+        if (args.length != params.size() + 1) {
+            return args;
+        }
+        if (params.isEmpty()) {
+            return args;
+        }
+        final ai.tegmentum.wasmtime4j.component.ComponentTypeDescriptor lastParam =
+                params.get(params.size() - 1).type();
+        if (lastParam.getType() != ai.tegmentum.wasmtime4j.component.ComponentType.RECORD) {
+            return args;
+        }
+        final java.util.Map<String, ai.tegmentum.wasmtime4j.component.ComponentTypeDescriptor> fields =
+                lastParam.getRecordFields();
+        final ai.tegmentum.wasmtime4j.component.ComponentTypeDescriptor limitField = fields.get("limit");
+        if (limitField == null || !isNumericOrOptionNumeric(limitField)) {
+            return args;
+        }
+        final int limitIdx = args.length - 2;
+        final int optsIdx = args.length - 1;
+        final long limitVal;
+        try {
+            limitVal = Long.parseLong(lexicalOf(args[limitIdx]));
+        } catch (IllegalArgumentException e) {
+            // Covers both NumberFormatException (parse failure) and
+            // IllegalArgumentException from lexicalOf for unsupported
+            // Value kinds — decline the fold, let the honest arg-count
+            // error surface downstream.
+            return args;
+        }
+        final String optsLex;
+        try {
+            optsLex = lexicalOf(args[optsIdx]);
+        } catch (IllegalArgumentException e) {
+            return args;
+        }
+        final String merged = mergePositionalLimitIntoOptsJson(optsLex, limitVal);
+        if (merged == null) {
+            return args;
+        }
+        final org.eclipse.rdf4j.model.impl.SimpleValueFactory vf =
+                org.eclipse.rdf4j.model.impl.SimpleValueFactory.getInstance();
+        final Value[] out = new Value[params.size()];
+        for (int i = 0, w = 0; i < args.length; i++) {
+            if (i == limitIdx) {
+                continue;
+            }
+            if (i == optsIdx) {
+                out[w++] = vf.createLiteral(merged);
+            } else {
+                out[w++] = args[i];
+            }
+        }
+        return out;
+    }
+
+    private static boolean isNumericOrOptionNumeric(
+            final ai.tegmentum.wasmtime4j.component.ComponentTypeDescriptor d) {
+        final ai.tegmentum.wasmtime4j.component.ComponentType kind = d.getType();
+        if (kind == ai.tegmentum.wasmtime4j.component.ComponentType.OPTION) {
+            return isNumericOrOptionNumeric(d.getOptionType());
+        }
+        switch (kind) {
+            case S8: case U8: case S16: case U16:
+            case S32: case U32: case S64: case U64:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Pure JSON merge: parse {@code optsLex} as an object, insert
+     * {@code "limit": <value>} if not already present, re-serialize.
+     * Returns {@code null} when the input isn't a JSON object or the
+     * re-serialize fails. An explicit `limit` key in the opts blob
+     * wins over the positional (matches the URL-sugar path's
+     * `or_insert_with` semantics). Split out for unit-testability.
+     * Uses Jackson (a transitive dep of RDF4J via jsonld-java) so we
+     * don't take a new dependency for a two-line parse.
+     */
+    static String mergePositionalLimitIntoOptsJson(final String optsLex, final long limit) {
+        try {
+            final tools.jackson.databind.json.JsonMapper mapper =
+                    tools.jackson.databind.json.JsonMapper.builder().build();
+            final tools.jackson.databind.JsonNode node = mapper.readTree(optsLex);
+            if (node == null || !node.isObject()) {
+                return null;
+            }
+            final tools.jackson.databind.node.ObjectNode obj =
+                    (tools.jackson.databind.node.ObjectNode) node;
+            if (!obj.has("limit")) {
+                obj.put("limit", limit);
+            }
+            return mapper.writeValueAsString(obj);
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     private java.util.Optional<ai.tegmentum.wasmtime4j.component.ComponentItemInfo.ComponentFuncInfo>

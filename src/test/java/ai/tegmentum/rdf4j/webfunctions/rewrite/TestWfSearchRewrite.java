@@ -244,10 +244,12 @@ public class TestWfSearchRewrite {
         assertThat(stringLit(spec, 2)).isEqualTo("manuals");
         assertThat(queryArg(spec)).isEqualTo("waterproof");
         // Bare URL — no user opts — opts_json carries the WIT-required
-        // `fields:[]` and `highlight:false` defaults plus the injected
-        // `limit` fallback. StringBuilder emission order is `fields`,
-        // `highlight`, `limit`, so the exact JSON is stable.
-        assertThat(optsArg(spec)).isEqualTo("{\"fields\":[],\"highlight\":false,\"limit\":10}");
+        // `fields:[]`, `highlight:false`, and `include-body:false`
+        // defaults plus the injected `limit` fallback. StringBuilder
+        // emission order is `fields`, `highlight`, `limit`,
+        // `include-body`, so the exact JSON is stable.
+        assertThat(optsArg(spec))
+                .isEqualTo("{\"fields\":[],\"highlight\":false,\"limit\":10,\"include-body\":false}");
         assertThat(spec.entryPoint()).isEqualTo("search");
         assertThat(spec.wasmUrl()).isEqualTo("file:///opt/wf_document.wasm");
     }
@@ -270,7 +272,13 @@ public class TestWfSearchRewrite {
         final InvokeSpec spec = takeFirstInvoke(inv);
         assertThat(optsArg(spec))
                 .contains("\"at_time\":\"2026-01-01T00:00:00Z\"")
-                .contains("\"include_body\":true");
+                // URL `?include_body=true` (snake) must land in
+                // opts_json as the WIT record's kebab-case field
+                // name `include-body` — otherwise the marshaller
+                // errors with "record missing required field
+                // `include-body`" before the guest is invoked.
+                .contains("\"include-body\":true")
+                .doesNotContain("\"include_body\":");
     }
 
     @Test
@@ -317,8 +325,10 @@ public class TestWfSearchRewrite {
         // Emission order matches buildOptsJson's insertion: `at_rev`
         // first (from the timeSpec branch), then the WIT-required
         // defaults `fields:[]` / `highlight:false`, then the injected
-        // `limit` fallback.
-        assertThat(optsArg(spec)).isEqualTo("{\"at_rev\":17,\"fields\":[],\"highlight\":false,\"limit\":10}");
+        // `limit` fallback, then the WIT-required
+        // `include-body:false` default (wave-6 addition).
+        assertThat(optsArg(spec))
+                .isEqualTo("{\"at_rev\":17,\"fields\":[],\"highlight\":false,\"limit\":10,\"include-body\":false}");
     }
 
     // ---------------------------------------------------------------------
@@ -414,14 +424,15 @@ public class TestWfSearchRewrite {
 
     @Test
     public void optsJsonIncludesRequiredWitFields() {
-        // The wf_document WIT `search-opts` record declares `fields:
-        // list<string>` and `highlight: bool` as non-optional (memo §04,
+        // The wf_document WIT `search-opts` record declares three
+        // non-optional bool/list fields — `fields: list<string>`,
+        // `highlight: bool`, and `include-body: bool` (memo §04,
         // `wf-document.wit` v1.3). The substrate coercer errors out on
-        // a missing required field before the dispatch reaches the
+        // any missing required field before the dispatch reaches the
         // guest ("arg 4 of `search`: record missing required field
-        // `fields`"), so every wf_document opts_json emission must
-        // include both. Parallel guard to the wf_fulltext test of the
-        // same name.
+        // `<name>`"), so every wf_document opts_json emission must
+        // include all three. Parallel guard to the wf_fulltext test of
+        // the same name.
         final DocumentRegistry reg = manualsRegistry();
         final InvokeRegistry inv = new InvokeRegistry();
         final ParsedQuery pq = parse(""
@@ -435,9 +446,56 @@ public class TestWfSearchRewrite {
         assertThat(rw.rewritePattern(pq.getTupleExpr())).isEqualTo(1);
         final InvokeSpec spec = takeFirstInvoke(inv);
         assertThat(optsArg(spec))
-                .as("opts_json must include the WIT-required `fields` and `highlight` defaults")
+                .as("opts_json must include the WIT-required `fields`, `highlight`, and `include-body` defaults")
                 .contains("\"fields\":[]")
-                .contains("\"highlight\":false");
+                .contains("\"highlight\":false")
+                .contains("\"include-body\":false");
+    }
+
+    @Test
+    public void optsJsonSnakeIncludeBodyUrlBecomesKebabWitKey() {
+        // URL query params are conventionally snake_case
+        // (`?include_body=true`) but the WIT `search-opts` record
+        // declares fields kebab-case (`include-body`). The emitter
+        // must translate on the way in — otherwise the marshaller
+        // fails with "record missing required field `include-body`".
+        final DocumentRegistry reg = manualsRegistry();
+        final InvokeRegistry inv = new InvokeRegistry();
+        final ParsedQuery pq = parse(""
+                + "PREFIX wf: <http://tegmentum.ai/ns/webfunction/>\n"
+                + "SELECT ?doc WHERE {\n"
+                + "  SERVICE <wf-search:manuals?include_body=true> {\n"
+                + "    ?_ wf:query \"waterproof\" ; wf:doc ?doc\n"
+                + "  }\n"
+                + "}");
+        final WfSearchRewrite rw = new WfSearchRewrite(reg, inv);
+        assertThat(rw.rewritePattern(pq.getTupleExpr())).isEqualTo(1);
+        final InvokeSpec spec = takeFirstInvoke(inv);
+        assertThat(optsArg(spec))
+                .as("URL ?include_body=true must emit kebab-case JSON key")
+                .contains("\"include-body\":true")
+                .doesNotContain("\"include_body\":");
+    }
+
+    @Test
+    public void optsJsonUrlFieldsPlaceholder() {
+        // Guard on existing behavior: `?fields=` isn't a whitelisted
+        // URL opt, so the emitted opts_json falls back to the
+        // WIT-required default `fields:[]`. Documents parity with
+        // the sibling Oxigraph / QLever / Jena tests.
+        final DocumentRegistry reg = manualsRegistry();
+        final InvokeRegistry inv = new InvokeRegistry();
+        final ParsedQuery pq = parse(""
+                + "PREFIX wf: <http://tegmentum.ai/ns/webfunction/>\n"
+                + "SELECT ?doc WHERE {\n"
+                + "  SERVICE <wf-search:manuals> {\n"
+                + "    ?_ wf:query \"waterproof\" ; wf:doc ?doc\n"
+                + "  }\n"
+                + "}");
+        final WfSearchRewrite rw = new WfSearchRewrite(reg, inv);
+        assertThat(rw.rewritePattern(pq.getTupleExpr())).isEqualTo(1);
+        final InvokeSpec spec = takeFirstInvoke(inv);
+        assertThat(optsArg(spec)).contains("\"fields\":[]");
     }
 
     // ---------------------------------------------------------------------

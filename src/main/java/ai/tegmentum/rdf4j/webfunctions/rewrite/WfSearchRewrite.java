@@ -727,9 +727,21 @@ public final class WfSearchRewrite implements QueryOptimizer {
                         // limit landed in the JSON.
                     }
                 }
-                case "highlight", "include_body" -> {
+                case "highlight" -> {
                     if (!first) sb.append(',');
                     sb.append('"').append(k).append("\":")
+                            .append("true".equalsIgnoreCase(v) ? "true" : "false");
+                    first = false;
+                }
+                case "include_body" -> {
+                    // Snake→kebab: URL query params are conventionally
+                    // snake_case (`?include_body=`) but the WIT
+                    // `search-opts` record declares its fields
+                    // kebab-case (`include-body`). Emit the kebab key
+                    // or the substrate marshaller fails with "record
+                    // missing required field `include-body`".
+                    if (!first) sb.append(',');
+                    sb.append("\"include-body\":")
                             .append("true".equalsIgnoreCase(v) ? "true" : "false");
                     first = false;
                 }
@@ -790,6 +802,18 @@ public final class WfSearchRewrite implements QueryOptimizer {
         if (parseLimit(opts, -1) < 0) {
             if (!first) sb.append(',');
             sb.append("\"limit\":").append(DEFAULT_LIMIT);
+            first = false;
+        }
+
+        // Third WIT-required non-option field on `search-opts`:
+        // `include-body: bool` (`wf-document.wit` v1.3). Emit a
+        // default `false` when the URL didn't supply `?include_body=`.
+        // The URL branch above already emitted the kebab-case key
+        // when present, so this defaults-block guard is on
+        // `include_body` (the URL parser's snake key).
+        if (!opts.containsKey("include_body")) {
+            if (!first) sb.append(',');
+            sb.append("\"include-body\":false");
             first = false;
         }
 
