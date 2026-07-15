@@ -1,7 +1,6 @@
 package ai.tegmentum.rdf4j.webfunctions.rewrite;
 
 import ai.tegmentum.rdf4j.webfunctions.rewrite.FederationRegistry.FederationSource;
-import ai.tegmentum.rdf4j.webfunctions.rewrite.FederationRegistry.SourceType;
 
 import org.eclipse.rdf4j.model.IRI;
 import org.eclipse.rdf4j.model.Literal;
@@ -20,9 +19,6 @@ import tools.jackson.databind.json.JsonMapper;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
-import java.util.OptionalInt;
-import java.util.OptionalLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -31,6 +27,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  * scenarios in {@code oxigraph-wf/src/wf_relational_rewrite.rs::tests}
  * so all four engine ports converge on identical fold semantics against
  * the same fixture JSON.
+ *
+ * <p>v0.3 &mdash; the sidecar {@code WfRelationalRegistry} was folded
+ * into {@link FederationSource#relationalConfig()}. All fixtures below
+ * build the federation registry from JSON so the {@code relational}
+ * block on each {@code wf-relational} source travels with the source
+ * entry the rewrite pass consults.
  */
 public class WfRelationalRewriteTest {
 
@@ -68,22 +70,19 @@ public class WfRelationalRewriteTest {
             }
             """;
 
-    private static WfRelationalRegistry customersRegistry() {
+    /**
+     * FederationRegistry parsed from {@link #CUSTOMERS_JSON}. The
+     * top-level {@code relational} block on the source is captured on
+     * {@link FederationSource#relationalConfig()} &mdash; the rewrite
+     * pass reads it from there.
+     */
+    private static FederationRegistry customersFederationRegistry() {
         try {
             final JsonNode root = JsonMapper.builder().build().readTree(CUSTOMERS_JSON);
-            return WfRelationalRegistry.fromJson(root);
+            return FederationRegistry.fromJson(root);
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
-    }
-
-    private static FederationRegistry customersFederationRegistry() {
-        return FederationRegistry.of(List.of(
-                new FederationSource("customers", SourceType.WF_RELATIONAL,
-                        "postgres://user@localhost/mydb",
-                        List.of("http://example.com/name", "http://example.com/tier"),
-                        OptionalInt.empty(), Optional.empty(),
-                        OptionalLong.empty(), java.util.Map.of())));
     }
 
     private static List<Service> collectServices(final TupleExpr expr) {
@@ -138,7 +137,7 @@ public class WfRelationalRewriteTest {
                 + "  }\n"
                 + "}");
         final WfRelationalRewrite rw = new WfRelationalRewrite(
-                customersFederationRegistry(), customersRegistry(), WF_FETCH_URL);
+                customersFederationRegistry(), WF_FETCH_URL);
         assertThat(rw.rewritePattern(pq.getTupleExpr())).isEqualTo(1);
         final List<Service> services = collectServices(pq.getTupleExpr());
         assertThat(services).hasSize(1);
@@ -154,7 +153,7 @@ public class WfRelationalRewriteTest {
                 + "SELECT ?c ?name WHERE {\n"
                 + "  SERVICE <wf-relational:customers> { ?c ex:name ?name }\n"
                 + "}");
-        new WfRelationalRewrite(customersFederationRegistry(), customersRegistry(), WF_FETCH_URL)
+        new WfRelationalRewrite(customersFederationRegistry(), WF_FETCH_URL)
                 .rewritePattern(pq.getTupleExpr());
         final JsonNode d = parseJson(descriptorArgJson(pq.getTupleExpr()));
         assertThat(d.get("sink_kind").asString()).isEqualTo("postgres");
@@ -180,7 +179,7 @@ public class WfRelationalRewriteTest {
                 + "SELECT ?c ?name WHERE {\n"
                 + "  SERVICE <wf-relational:customers> { ?c ex:name ?name }\n"
                 + "}");
-        new WfRelationalRewrite(customersFederationRegistry(), customersRegistry(), WF_FETCH_URL)
+        new WfRelationalRewrite(customersFederationRegistry(), WF_FETCH_URL)
                 .rewritePattern(pq.getTupleExpr());
         final JsonNode d = parseJson(descriptorArgJson(pq.getTupleExpr()));
         assertThat(d.get("emit_provenance").asBoolean()).isTrue();
@@ -191,15 +190,53 @@ public class WfRelationalRewriteTest {
     // Short-circuits & guards
     // ---------------------------------------------------------------------
 
+    /**
+     * Empty federation registry short-circuits &mdash; nothing to
+     * fold. Matches the pre-v0.3 empty-sidecar short-circuit.
+     */
     @Test
-    public void emptyRelationalRegistryShortCircuits() {
+    public void emptyRegistryShortCircuits() {
         final ParsedQuery pq = parse(""
                 + "PREFIX ex: <http://example.com/>\n"
                 + "SELECT ?c ?name WHERE {\n"
                 + "  SERVICE <wf-relational:customers> { ?c ex:name ?name }\n"
                 + "}");
         final WfRelationalRewrite rw = new WfRelationalRewrite(
-                customersFederationRegistry(), WfRelationalRegistry.empty(), WF_FETCH_URL);
+                FederationRegistry.empty(), WF_FETCH_URL);
+        assertThat(rw.rewritePattern(pq.getTupleExpr())).isZero();
+        final List<Service> services = collectServices(pq.getTupleExpr());
+        assertThat(services).hasSize(1);
+        assertThat(((IRI) services.get(0).getServiceRef().getValue()).stringValue())
+                .isEqualTo("wf-relational:customers");
+    }
+
+    /**
+     * v0.3 unification &mdash; a {@code wf-relational} source
+     * registered with no {@code relational} block means
+     * {@link FederationSource#relationalConfig()} is empty, and the
+     * rewrite pass leaves the SERVICE alone. Matches the old sidecar's
+     * "descriptor-missing &rarr; skip" behavior.
+     */
+    @Test
+    public void wfRelationalWithoutConfigLeftAlone() {
+        final String json = """
+                {"sources": [{
+                    "name": "customers",
+                    "type": "wf-relational",
+                    "endpoint": "postgres://ex/db"
+                }]}""";
+        final FederationRegistry fed;
+        try {
+            fed = FederationRegistry.fromJson(JsonMapper.builder().build().readTree(json));
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+        final ParsedQuery pq = parse(""
+                + "PREFIX ex: <http://example.com/>\n"
+                + "SELECT ?c ?name WHERE {\n"
+                + "  SERVICE <wf-relational:customers> { ?c ex:name ?name }\n"
+                + "}");
+        final WfRelationalRewrite rw = new WfRelationalRewrite(fed, WF_FETCH_URL);
         assertThat(rw.rewritePattern(pq.getTupleExpr())).isZero();
         final List<Service> services = collectServices(pq.getTupleExpr());
         assertThat(services).hasSize(1);
@@ -215,11 +252,16 @@ public class WfRelationalRewriteTest {
                 + "  SERVICE <wf-relational:customers> { ?c ex:name ?name }\n"
                 + "}");
         final WfRelationalRewrite rw = new WfRelationalRewrite(
-                customersFederationRegistry(), customersRegistry(), "");
+                customersFederationRegistry(), "");
         assertThat(rw.rewritePattern(pq.getTupleExpr())).isZero();
         assertThat(collectServices(pq.getTupleExpr())).hasSize(1);
     }
 
+    /**
+     * Unknown source name &mdash; federation registry has {@code
+     * customers} but the query references {@code unknown}. The rewrite
+     * pass must leave the SERVICE alone.
+     */
     @Test
     public void unknownSourceNameLeftAlone() {
         final ParsedQuery pq = parse(""
@@ -227,10 +269,8 @@ public class WfRelationalRewriteTest {
                 + "SELECT ?c ?name WHERE {\n"
                 + "  SERVICE <wf-relational:unknown> { ?c ex:name ?name }\n"
                 + "}");
-        // Federation registry is empty here; passthrough on unknown name
-        // is the "explicit SERVICE for a name we don't recognise" path.
         final WfRelationalRewrite rw = new WfRelationalRewrite(
-                FederationRegistry.empty(), customersRegistry(), WF_FETCH_URL);
+                customersFederationRegistry(), WF_FETCH_URL);
         assertThat(rw.rewritePattern(pq.getTupleExpr())).isZero();
         final List<Service> services = collectServices(pq.getTupleExpr());
         assertThat(services).hasSize(1);
@@ -239,22 +279,40 @@ public class WfRelationalRewriteTest {
     }
 
     /**
-     * Federation registry declares a source with the same name but a
-     * different type. The defensive check refuses to fold. Synthetic
-     * setup &mdash; real deployments keep the two aligned.
+     * Federation registry has {@code customers} typed {@code sparql}
+     * &mdash; the source-type check refuses to fold even though a
+     * {@code relational} block is present (synthetic
+     * misconfiguration). Real deployments always align the type + the
+     * relational block.
      */
     @Test
     public void wrongSourceTypeLeftAlone() {
-        final FederationRegistry misaligned = FederationRegistry.of(List.of(
-                new FederationSource("customers", SourceType.SPARQL,
-                        "http://example/query", List.of(), OptionalInt.empty())));
+        final String json = """
+                {"sources": [{
+                    "name": "customers",
+                    "type": "sparql",
+                    "endpoint": "http://example/query",
+                    "relational": {
+                        "sink_kind": "postgres",
+                        "table": "customers",
+                        "subject_column": "id",
+                        "columns": [
+                            {"name": "id", "role": "subject_iri", "type": "iri"}
+                        ]
+                    }
+                }]}""";
+        final FederationRegistry misaligned;
+        try {
+            misaligned = FederationRegistry.fromJson(JsonMapper.builder().build().readTree(json));
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
         final ParsedQuery pq = parse(""
                 + "PREFIX ex: <http://example.com/>\n"
                 + "SELECT ?c ?name WHERE {\n"
                 + "  SERVICE <wf-relational:customers> { ?c ex:name ?name }\n"
                 + "}");
-        final WfRelationalRewrite rw = new WfRelationalRewrite(
-                misaligned, customersRegistry(), WF_FETCH_URL);
+        final WfRelationalRewrite rw = new WfRelationalRewrite(misaligned, WF_FETCH_URL);
         assertThat(rw.rewritePattern(pq.getTupleExpr())).isZero();
     }
 
@@ -266,7 +324,6 @@ public class WfRelationalRewriteTest {
     public void pipelineWiresRewritePassWhenRegistryPopulated() {
         final RewritePipeline pipeline = RewritePipeline.builder()
                 .federationRegistry(customersFederationRegistry())
-                .wfRelationalRegistry(customersRegistry())
                 .wfFetchUrl(WF_FETCH_URL)
                 .build();
         final ParsedQuery pq = parse(""
@@ -281,10 +338,27 @@ public class WfRelationalRewriteTest {
                 .isEqualTo(WF_CALL_IRI);
     }
 
+    /**
+     * A wf-relational source with no {@code relational} block on the
+     * federation entry keeps the pipeline inert &mdash; the fold pass
+     * refuses because {@code relationalConfig()} is empty.
+     */
     @Test
-    public void pipelineEmptyRelationalRegistryStaysInert() {
+    public void pipelineWfRelationalWithoutConfigStaysInert() {
+        final String json = """
+                {"sources": [{
+                    "name": "customers",
+                    "type": "wf-relational",
+                    "endpoint": "postgres://ex/db"
+                }]}""";
+        final FederationRegistry fed;
+        try {
+            fed = FederationRegistry.fromJson(JsonMapper.builder().build().readTree(json));
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
         final RewritePipeline pipeline = RewritePipeline.builder()
-                .federationRegistry(customersFederationRegistry())
+                .federationRegistry(fed)
                 .wfFetchUrl(WF_FETCH_URL)
                 .build();
         final ParsedQuery pq = parse(""
@@ -297,57 +371,5 @@ public class WfRelationalRewriteTest {
         assertThat(services).hasSize(1);
         assertThat(((IRI) services.get(0).getServiceRef().getValue()).stringValue())
                 .isEqualTo("wf-relational:customers");
-    }
-
-    // ---------------------------------------------------------------------
-    // Registry parse — smoke check that the sidecar sees `relational`.
-    // ---------------------------------------------------------------------
-
-    @Test
-    public void registrySkipsNonRelationalSources() {
-        final String json = """
-                {"sources": [
-                  {"name": "products", "type": "sparql", "endpoint": "http://ex/query"},
-                  {"name": "manuals", "type": "wf-search", "endpoint": "wf-search:manuals"}
-                ]}""";
-        try {
-            final WfRelationalRegistry reg = WfRelationalRegistry.fromJsonText(json);
-            assertThat(reg.isEmpty()).isTrue();
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    @Test
-    public void registrySkipsRelationalWithoutDescriptorBlock() {
-        final String json = """
-                {"sources": [
-                  {"name": "orphan", "type": "wf-relational", "endpoint": "postgres://ex/db"}
-                ]}""";
-        try {
-            final WfRelationalRegistry reg = WfRelationalRegistry.fromJsonText(json);
-            assertThat(reg.isEmpty()).isTrue();
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    @Test
-    public void registryParsesCustomerEntry() {
-        final WfRelationalRegistry reg = customersRegistry();
-        assertThat(reg.size()).isEqualTo(1);
-        final WfRelationalRegistry.RelationalEntry e = reg.byName("customers");
-        assertThat(e).isNotNull();
-        assertThat(e.endpoint()).isEqualTo("postgres://user@localhost/mydb");
-        assertThat(e.descriptor().sinkKind()).isEqualTo("postgres");
-        assertThat(e.descriptor().table()).isEqualTo("customers");
-        assertThat(e.descriptor().subjectColumn()).isEqualTo("id");
-        assertThat(e.descriptor().anchor().anchorClass())
-                .isEqualTo("http://example.com/Customer");
-        assertThat(e.descriptor().emitProvenance()).isTrue();
-        assertThat(e.descriptor().schemaVersion()).isEqualTo("1");
-        assertThat(e.descriptor().columnsByPredicate())
-                .containsEntry("http://example.com/name", "name")
-                .containsEntry("http://example.com/tier", "tier");
     }
 }

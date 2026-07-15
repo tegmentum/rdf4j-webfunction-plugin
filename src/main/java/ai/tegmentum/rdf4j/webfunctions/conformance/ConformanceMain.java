@@ -1,7 +1,10 @@
 package ai.tegmentum.rdf4j.webfunctions.conformance;
 
+import ai.tegmentum.rdf4j.webfunctions.CallbackContext;
+import ai.tegmentum.rdf4j.webfunctions.Rdf4jWasmInstance;
 import ai.tegmentum.rdf4j.webfunctions.WfEvaluationStrategyFactory;
 import ai.tegmentum.rdf4j.webfunctions.WfServiceResolver;
+import ai.tegmentum.rdf4j.webfunctions.WitValueMarshaller;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.AliasMap;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.AliasRewriteState;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.ConversionRegistry;
@@ -11,8 +14,11 @@ import ai.tegmentum.rdf4j.webfunctions.rewrite.FulltextRegistry;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.RewritePipeline;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.ShapeEntry;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.ShapeRegistry;
-import ai.tegmentum.rdf4j.webfunctions.rewrite.WfRelationalRegistry;
+import org.eclipse.rdf4j.model.Literal;
 import org.eclipse.rdf4j.model.Statement;
+import org.eclipse.rdf4j.model.Value;
+import org.eclipse.rdf4j.model.ValueFactory;
+import org.eclipse.rdf4j.model.impl.SimpleValueFactory;
 import org.eclipse.rdf4j.query.BindingSet;
 import org.eclipse.rdf4j.query.BooleanQuery;
 import org.eclipse.rdf4j.query.GraphQuery;
@@ -33,6 +39,8 @@ import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.json.JsonMapper;
 
 import java.io.PrintStream;
+import java.net.URI;
+import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -94,6 +102,23 @@ public final class ConformanceMain {
 
     /** Testable entry point; returns the process exit code. */
     public static int run(final String[] args, final PrintStream out, final PrintStream err) throws Exception {
+        // Canonicalize-sweep CLI mode: mirrors the oxigraph-wf
+        // `/admin/canonicalize-sweep` endpoint. RDF4J's ConformanceMain
+        // has no persistent HTTP server for the wf-conformance harness
+        // to poke, so the harness re-invokes this main with
+        // `--canonicalize-sweep --sweep-config <path>`, we load
+        // wf_canonicalize.wasm via Rdf4jWasmInstance, dispatch one
+        // evaluate() with the config JSON as a literal arg, print a
+        // JSON status line, and exit. Detected here (not in parseArgs)
+        // because parseArgs enforces value-per-flag.
+        if (containsFlag(args, "--canonicalize-sweep")) {
+            final String sweepCfg = valueFor(args, "--sweep-config");
+            if (sweepCfg == null) {
+                err.println("--sweep-config <path> required with --canonicalize-sweep");
+                return 2;
+            }
+            return runCanonicalizeSweep(Path.of(sweepCfg), out, err);
+        }
         final Args parsed = parseArgs(args, err);
         if (parsed == null) return 2;
 
@@ -163,26 +188,14 @@ public final class ConformanceMain {
                     + " federation source(s) from " + parsed.federationConfig);
         }
 
-        // Sidecar wf-relational registry: reads the SAME
-        // --federation-config file that FederationRegistry consumes, but
-        // only captures the `relational` extension block that
-        // FederationRegistry drops. Empty file / no wf-relational sources
-        // => empty registry => WfRelationalRewrite short-circuits.
-        final WfRelationalRegistry wfRelationalRegistry;
-        try {
-            wfRelationalRegistry = parsed.federationConfig == null
-                    ? WfRelationalRegistry.empty()
-                    : WfRelationalRegistry.loadFromJson(parsed.federationConfig);
-        } catch (Exception e) {
-            err.println("wf-relational config error: " + e.getMessage());
-            return 2;
-        }
-        if (parsed.federationConfig != null && !wfRelationalRegistry.isEmpty()) {
-            err.println("loaded " + wfRelationalRegistry.size()
-                    + " wf-relational source(s) from " + parsed.federationConfig);
-        }
+        // v0.3 — wf-relational shape descriptors ride on
+        // FederationSource.relationalConfig(), populated by the same
+        // FederationRegistry parse above. The sidecar
+        // WfRelationalRegistry that used to re-parse the same file was
+        // folded away; WfRelationalRewrite now reads the descriptor
+        // straight off the federation registry entry.
 
-        final RewritePipeline pipeline = loadPipeline(parsed, fulltextRegistry, documentRegistry, federationRegistry, wfRelationalRegistry, err);
+        final RewritePipeline pipeline = loadPipeline(parsed, fulltextRegistry, documentRegistry, federationRegistry, err);
         if (pipeline == null) return 2;
 
         final MemoryStore store = new MemoryStore();
@@ -356,6 +369,112 @@ public final class ConformanceMain {
         };
     }
 
+    // ---- canonicalize-sweep CLI mode --------------------------------------
+
+    /**
+     * In-process replacement for oxigraph-wf's
+     * {@code POST /admin/canonicalize-sweep} endpoint. See the sibling
+     * Jena {@code ConformanceMain#runCanonicalizeSweep} for the design
+     * rationale — RDF4J's ConformanceMain has the same one-shot CLI
+     * shape and needs the same admin surface for parity.
+     *
+     * <p>The sweep config file mirrors oxigraph-wf's
+     * {@code build_canonicalize_sweep_config} output with one added
+     * top-level field:
+     * <ul>
+     *   <li>{@code canonicalize_wasm_url} — URL of wf_canonicalize.wasm.
+     *       Stripped from the payload before it reaches the guest.</li>
+     * </ul>
+     * The remainder ({@code sink}, {@code rule},
+     * {@code fulltext_indexes}, {@code document_indexes},
+     * {@code full_scan}) is passed through verbatim as a string
+     * literal into the guest's {@code evaluate} export.
+     *
+     * <p>Prints {@code {"status":"ok","processed":N}} on success and
+     * returns 0. {@code N} sums the numeric literal cells in the
+     * guest's first result row.
+     */
+    private static int runCanonicalizeSweep(final Path sweepCfgPath,
+                                            final PrintStream out,
+                                            final PrintStream err) {
+        final JsonNode cfg;
+        try {
+            cfg = MAPPER.readTree(Files.readString(sweepCfgPath));
+        } catch (Exception e) {
+            err.println("sweep config error: " + e.getMessage());
+            return 2;
+        }
+        if (!cfg.hasNonNull("canonicalize_wasm_url")) {
+            err.println("sweep config error: missing `canonicalize_wasm_url`");
+            return 2;
+        }
+        final String wasmUrl = cfg.get("canonicalize_wasm_url").asString();
+
+        // Copy every top-level field except our own wiring key. The
+        // remaining object is what the guest reads at evaluate() time.
+        final tools.jackson.databind.node.ObjectNode guest = MAPPER.createObjectNode();
+        for (String k : cfg.propertyNames()) {
+            if ("canonicalize_wasm_url".equals(k)) continue;
+            guest.set(k, cfg.get(k));
+        }
+        final String guestCfgJson = guest.toString();
+
+        // Bind a CallbackContext so the guest's sink-open / sink-execute
+        // / sink-close callbacks land on a live handle table. The sweep
+        // guest never enters the SPARQL engine — it opens SQLite sinks
+        // and POSTs to Manticore — so null strategy/tripleSource is
+        // safe; only the sink handle machinery gets exercised.
+        CallbackContext.bind(null, null);
+        long processed = 0;
+        try {
+            final URL wasm = URI.create(wasmUrl).toURL();
+            final ValueFactory vf = SimpleValueFactory.getInstance();
+            try (Rdf4jWasmInstance instance = new Rdf4jWasmInstance(wasm)) {
+                final Value cfgLit = vf.createLiteral(guestCfgJson);
+                final List<WitValueMarshaller.Row> rows = instance.evaluate(vf, cfgLit);
+                if (!rows.isEmpty()) {
+                    for (Value v : rows.get(0).values) {
+                        if (v instanceof Literal l) {
+                            try {
+                                processed += Long.parseLong(l.getLabel());
+                            } catch (NumberFormatException ignore) {
+                                // Non-numeric literal (e.g. a status
+                                // string) — skip; only numeric cells
+                                // contribute to the processed count.
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            err.println("canonicalize sweep failed: " + e.getMessage());
+            e.printStackTrace(err);
+            return 3;
+        } finally {
+            CallbackContext.unbind();
+        }
+
+        out.print("{\"status\":\"ok\",\"processed\":");
+        out.print(processed);
+        out.println("}");
+        out.flush();
+        return 0;
+    }
+
+    private static boolean containsFlag(final String[] args, final String flag) {
+        for (String a : args) {
+            if (flag.equals(a)) return true;
+        }
+        return false;
+    }
+
+    private static String valueFor(final String[] args, final String flag) {
+        for (int i = 0; i < args.length - 1; i++) {
+            if (flag.equals(args[i])) return args[i + 1];
+        }
+        return null;
+    }
+
     // ---- argument parsing -------------------------------------------------
 
     static final class Args {
@@ -411,7 +530,6 @@ public final class ConformanceMain {
     static RewritePipeline loadPipeline(final Args a, final FulltextRegistry fulltextRegistry,
                                         final DocumentRegistry documentRegistry,
                                         final FederationRegistry federationRegistry,
-                                        final WfRelationalRegistry wfRelationalRegistry,
                                         final PrintStream err) {
         try {
             final RewritePipeline.Builder b = RewritePipeline.builder();
@@ -421,7 +539,6 @@ public final class ConformanceMain {
             if (fulltextRegistry   != null && !fulltextRegistry.isEmpty()) b.fulltextRegistry(fulltextRegistry);
             if (documentRegistry   != null && !documentRegistry.isEmpty()) b.documentRegistry(documentRegistry);
             if (federationRegistry != null && !federationRegistry.isEmpty()) b.federationRegistry(federationRegistry);
-            if (wfRelationalRegistry != null && !wfRelationalRegistry.isEmpty()) b.wfRelationalRegistry(wfRelationalRegistry);
             if (a.partialConfig    != null) {
                 final JsonNode root = MAPPER.readTree(Files.readString(a.partialConfig));
                 if (root.hasNonNull("wf_fetch_url")) {

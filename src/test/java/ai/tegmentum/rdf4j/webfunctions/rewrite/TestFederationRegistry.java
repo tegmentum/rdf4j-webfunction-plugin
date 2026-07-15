@@ -397,6 +397,107 @@ public class TestFederationRegistry {
                 .containsExactlyInAnyOrder("declared", "undeclared");
     }
 
+    // ---------------------------------------------------------------------
+    // v0.3 wf-relational extension — the `relational` block on a
+    // `wf-relational` source is captured on FederationSource.relationalConfig()
+    // (no sidecar registry). Prior to v0.3 the block was dropped by
+    // FederationRegistry and re-parsed by WfRelationalRegistry; the two
+    // registries were unified so all per-source state lives together and
+    // future extension source types can follow the same pattern.
+    // ---------------------------------------------------------------------
+
+    @Test
+    public void relationalConfigCapturedOnWfRelationalSource() {
+        final FederationRegistry reg = parse("""
+                {"sources": [{
+                    "name": "customers",
+                    "type": "wf-relational",
+                    "endpoint": "postgres://user@localhost/mydb",
+                    "predicates": ["http://ex/name", "http://ex/tier"],
+                    "relational": {
+                        "sink_kind": "postgres",
+                        "table": "customers",
+                        "subject_column": "id",
+                        "anchor": {"class": "http://ex/Customer"},
+                        "columns": [
+                            {"name": "id",   "role": "subject_iri", "type": "iri"},
+                            {"name": "name", "role": "column", "type": "string",
+                             "predicate": "http://ex/name"},
+                            {"name": "tier", "role": "column", "type": "string",
+                             "predicate": "http://ex/tier"}
+                        ],
+                        "emit_provenance": true,
+                        "iri_template": "{id}",
+                        "schema_version": "1"
+                    }
+                }]}""");
+        final FederationSource entry = reg.byName("customers");
+        assertThat(entry.sourceType()).isEqualTo(SourceType.WF_RELATIONAL);
+        assertThat(entry.relationalConfig()).isPresent();
+        final FederationRegistry.RelationalConfig cfg = entry.relationalConfig().orElseThrow();
+        assertThat(cfg.sinkKind()).isEqualTo("postgres");
+        assertThat(cfg.table()).isEqualTo("customers");
+        assertThat(cfg.subjectColumn()).isEqualTo("id");
+        assertThat(cfg.anchor().anchorClass()).isEqualTo("http://ex/Customer");
+        assertThat(cfg.emitProvenance()).isTrue();
+        assertThat(cfg.iriTemplate()).isEqualTo("{id}");
+        assertThat(cfg.schemaVersion()).isEqualTo("1");
+        assertThat(cfg.columnsByPredicate())
+                .containsEntry("http://ex/name", "name")
+                .containsEntry("http://ex/tier", "tier");
+    }
+
+    /**
+     * A {@code wf-relational} source with no {@code relational} block
+     * parses fine; {@link FederationSource#relationalConfig()} is empty.
+     * The {@link WfRelationalRewrite} pass treats that as "leave the
+     * SERVICE alone" &mdash; same semantics the old sidecar registry
+     * provided when its per-name lookup missed.
+     */
+    @Test
+    public void relationalConfigEmptyWhenBlockAbsent() {
+        final FederationRegistry reg = parse("""
+                {"sources": [{
+                    "name": "orphan",
+                    "type": "wf-relational",
+                    "endpoint": "postgres://ex/db"
+                }]}""");
+        final FederationSource entry = reg.byName("orphan");
+        assertThat(entry.sourceType()).isEqualTo(SourceType.WF_RELATIONAL);
+        assertThat(entry.relationalConfig()).isEmpty();
+    }
+
+    /**
+     * The {@code relational} block only meaningfully applies to
+     * {@code wf-relational} sources, but the parser doesn't reject it
+     * on other types &mdash; the block is captured on
+     * {@link FederationSource#relationalConfig()} and the rewrite pass
+     * only consults it when the source type also matches. Silent
+     * capture keeps parsing forgiving; the rewrite pass's source-type
+     * check gates use.
+     */
+    @Test
+    public void relationalBlockCapturedRegardlessOfType() {
+        final FederationRegistry reg = parse("""
+                {"sources": [{
+                    "name": "hybrid",
+                    "type": "sparql",
+                    "endpoint": "http://ex/query",
+                    "relational": {
+                        "sink_kind": "postgres",
+                        "table": "t",
+                        "subject_column": "id",
+                        "columns": [
+                            {"name": "id", "role": "subject_iri", "type": "iri"}
+                        ]
+                    }
+                }]}""");
+        final FederationSource entry = reg.byName("hybrid");
+        // Descriptor captured — but WfRelationalRewrite will refuse to
+        // fold because sourceType is SPARQL, not WF_RELATIONAL.
+        assertThat(entry.relationalConfig()).isPresent();
+    }
+
     @Test
     public void probeModeOffIsStaticOnly() {
         final FederationRegistry reg = parse("""
