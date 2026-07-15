@@ -419,14 +419,35 @@ public final class ConformanceMain {
         }
         final String guestCfgJson = guest.toString();
 
-        // Bind a CallbackContext so the guest's sink-open / sink-execute
-        // / sink-close callbacks land on a live handle table. The sweep
-        // guest never enters the SPARQL engine — it opens SQLite sinks
-        // and POSTs to Manticore — so null strategy/tripleSource is
-        // safe; only the sink handle machinery gets exercised.
-        CallbackContext.bind(null, null);
+        // Stand up an empty MemoryStore + SailRepository with the
+        // webfunction strategy factory. This binds a live
+        // CallbackContext (via WfEvaluationStrategyFactory) so the
+        // sweep guest's sink-open / sink-execute / sink-close and
+        // execute-query callbacks all resolve. The store is empty —
+        // execute-query lookups (e.g. owl:sameAs canonicalisation)
+        // return no rows, which is the correct behaviour for a sweep
+        // that has no ambient graph.
+        final MemoryStore store = new MemoryStore();
+        // Pass the store as the Sail so the callback context can honour
+        // execute-update from the sweep guest (owl:sameAs deletions land
+        // against this empty write connection — a noop against no
+        // matching triples).
+        store.setEvaluationStrategyFactory(
+                new WfEvaluationStrategyFactory(new SPARQLServiceResolver(), store));
+        final SailRepository repo = new SailRepository(store);
+        repo.init();
+
         long processed = 0;
-        try {
+        try (RepositoryConnection conn = repo.getConnection()) {
+            // Prime the strategy factory. Its createEvaluationStrategy
+            // implementation calls CallbackContext.bind on the newly
+            // constructed strategy; the binding leaks past query
+            // teardown (see the factory's own class comment), which is
+            // exactly what we want here.
+            try (var r = conn.prepareTupleQuery("SELECT * WHERE {} LIMIT 0").evaluate()) {
+                while (r.hasNext()) r.next();
+            }
+
             final URL wasm = URI.create(wasmUrl).toURL();
             final ValueFactory vf = SimpleValueFactory.getInstance();
             try (Rdf4jWasmInstance instance = new Rdf4jWasmInstance(wasm)) {
@@ -452,6 +473,7 @@ public final class ConformanceMain {
             return 3;
         } finally {
             CallbackContext.unbind();
+            repo.shutDown();
         }
 
         out.print("{\"status\":\"ok\",\"processed\":");
