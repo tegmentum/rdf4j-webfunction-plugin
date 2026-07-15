@@ -53,6 +53,7 @@ public final class RewritePipeline {
     private final DocumentRegistry documentRegistry;
     private final FederationRegistry federationRegistry;
     private final ShapeRegistry shapeRegistry;
+    private final WfRelationalRegistry wfRelationalRegistry;
     private final String wfFetchUrl;
 
     /**
@@ -70,6 +71,7 @@ public final class RewritePipeline {
         this.documentRegistry   = b.documentRegistry   == null ? DocumentRegistry.empty()  : b.documentRegistry;
         this.federationRegistry = b.federationRegistry == null ? FederationRegistry.empty(): b.federationRegistry;
         this.shapeRegistry      = b.shapeRegistry      == null ? ShapeRegistry.empty()     : b.shapeRegistry;
+        this.wfRelationalRegistry = b.wfRelationalRegistry == null ? WfRelationalRegistry.empty() : b.wfRelationalRegistry;
         this.wfFetchUrl         = b.wfFetchUrl;
         this.aliasRewrite       = new AliasRewrite(this.aliasMap);
     }
@@ -83,6 +85,7 @@ public final class RewritePipeline {
     public DocumentRegistry   documentRegistry()   { return documentRegistry; }
     public FederationRegistry federationRegistry() { return federationRegistry; }
     public ShapeRegistry      shapeRegistry()      { return shapeRegistry; }
+    public WfRelationalRegistry wfRelationalRegistry() { return wfRelationalRegistry; }
     public String             wfFetchUrl()         { return wfFetchUrl; }
 
     /**
@@ -188,6 +191,18 @@ public final class RewritePipeline {
                 && wfFetchUrl != null && !wfFetchUrl.isEmpty()) {
             out.add(new WfFetchRewrite(federationRegistry, shapeRegistry, wfFetchUrl));
         }
+        // WfRelationalRewrite runs immediately after WfFetchRewrite and
+        // before ShapeRewrite. Folds SERVICE <wf-relational:<name>>
+        // (emitted by WfFederationRewrite for WF_RELATIONAL-typed
+        // sources) into the same SERVICE <wf:call> envelope, with the
+        // shape descriptor's `sink_kind = "postgres"` steering wf_fetch
+        // to Postgres-SQL. Bridge: FederationRegistry names the source
+        // and confirms WF_RELATIONAL type; WfRelationalRegistry supplies
+        // the Postgres shape descriptor; both keyed by the same name.
+        if (wfRelationalRegistry != null && !wfRelationalRegistry.isEmpty()
+                && wfFetchUrl != null && !wfFetchUrl.isEmpty()) {
+            out.add(new WfRelationalRewrite(federationRegistry, wfRelationalRegistry, wfFetchUrl));
+        }
         if (shapeRegistry != null && !shapeRegistry.isEmpty()
                 && wfFetchUrl != null && !wfFetchUrl.isEmpty()) {
             out.add(new ShapeRewrite(shapeRegistry, wfFetchUrl));
@@ -208,7 +223,8 @@ public final class RewritePipeline {
                 && (fulltextRegistry == null   || fulltextRegistry.isEmpty())
                 && (documentRegistry == null   || documentRegistry.isEmpty())
                 && (federationRegistry == null || federationRegistry.isEmpty())
-                && (shapeRegistry == null      || shapeRegistry.isEmpty());
+                && (shapeRegistry == null      || shapeRegistry.isEmpty())
+                && (wfRelationalRegistry == null || wfRelationalRegistry.isEmpty());
     }
 
     public static final class Builder {
@@ -219,6 +235,7 @@ public final class RewritePipeline {
         private DocumentRegistry documentRegistry;
         private FederationRegistry federationRegistry;
         private ShapeRegistry shapeRegistry;
+        private WfRelationalRegistry wfRelationalRegistry;
         private String wfFetchUrl;
 
         public Builder invokeRegistry(final InvokeRegistry r)         { this.invokeRegistry = r; return this; }
@@ -228,6 +245,7 @@ public final class RewritePipeline {
         public Builder documentRegistry(final DocumentRegistry r)     { this.documentRegistry = r; return this; }
         public Builder federationRegistry(final FederationRegistry r) { this.federationRegistry = r; return this; }
         public Builder shapeRegistry(final ShapeRegistry r)           { this.shapeRegistry = r; return this; }
+        public Builder wfRelationalRegistry(final WfRelationalRegistry r) { this.wfRelationalRegistry = r; return this; }
         public Builder wfFetchUrl(final String url)                   { this.wfFetchUrl = url; return this; }
 
         public RewritePipeline build() { return new RewritePipeline(this); }

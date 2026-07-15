@@ -11,6 +11,7 @@ import ai.tegmentum.rdf4j.webfunctions.rewrite.FulltextRegistry;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.RewritePipeline;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.ShapeEntry;
 import ai.tegmentum.rdf4j.webfunctions.rewrite.ShapeRegistry;
+import ai.tegmentum.rdf4j.webfunctions.rewrite.WfRelationalRegistry;
 import org.eclipse.rdf4j.model.Statement;
 import org.eclipse.rdf4j.query.BindingSet;
 import org.eclipse.rdf4j.query.BooleanQuery;
@@ -162,7 +163,26 @@ public final class ConformanceMain {
                     + " federation source(s) from " + parsed.federationConfig);
         }
 
-        final RewritePipeline pipeline = loadPipeline(parsed, fulltextRegistry, documentRegistry, federationRegistry, err);
+        // Sidecar wf-relational registry: reads the SAME
+        // --federation-config file that FederationRegistry consumes, but
+        // only captures the `relational` extension block that
+        // FederationRegistry drops. Empty file / no wf-relational sources
+        // => empty registry => WfRelationalRewrite short-circuits.
+        final WfRelationalRegistry wfRelationalRegistry;
+        try {
+            wfRelationalRegistry = parsed.federationConfig == null
+                    ? WfRelationalRegistry.empty()
+                    : WfRelationalRegistry.loadFromJson(parsed.federationConfig);
+        } catch (Exception e) {
+            err.println("wf-relational config error: " + e.getMessage());
+            return 2;
+        }
+        if (parsed.federationConfig != null && !wfRelationalRegistry.isEmpty()) {
+            err.println("loaded " + wfRelationalRegistry.size()
+                    + " wf-relational source(s) from " + parsed.federationConfig);
+        }
+
+        final RewritePipeline pipeline = loadPipeline(parsed, fulltextRegistry, documentRegistry, federationRegistry, wfRelationalRegistry, err);
         if (pipeline == null) return 2;
 
         final MemoryStore store = new MemoryStore();
@@ -390,7 +410,9 @@ public final class ConformanceMain {
 
     static RewritePipeline loadPipeline(final Args a, final FulltextRegistry fulltextRegistry,
                                         final DocumentRegistry documentRegistry,
-                                        final FederationRegistry federationRegistry, final PrintStream err) {
+                                        final FederationRegistry federationRegistry,
+                                        final WfRelationalRegistry wfRelationalRegistry,
+                                        final PrintStream err) {
         try {
             final RewritePipeline.Builder b = RewritePipeline.builder();
             if (a.aliasConfig      != null) b.aliasMap(loadAliasMap(a.aliasConfig));
@@ -399,6 +421,7 @@ public final class ConformanceMain {
             if (fulltextRegistry   != null && !fulltextRegistry.isEmpty()) b.fulltextRegistry(fulltextRegistry);
             if (documentRegistry   != null && !documentRegistry.isEmpty()) b.documentRegistry(documentRegistry);
             if (federationRegistry != null && !federationRegistry.isEmpty()) b.federationRegistry(federationRegistry);
+            if (wfRelationalRegistry != null && !wfRelationalRegistry.isEmpty()) b.wfRelationalRegistry(wfRelationalRegistry);
             if (a.partialConfig    != null) {
                 final JsonNode root = MAPPER.readTree(Files.readString(a.partialConfig));
                 if (root.hasNonNull("wf_fetch_url")) {
