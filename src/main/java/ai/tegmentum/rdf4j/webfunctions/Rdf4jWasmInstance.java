@@ -31,22 +31,31 @@ public final class Rdf4jWasmInstance implements Closeable {
 
     private static volatile Engine SHARED_ENGINE;
     private static final Object ENGINE_LOCK = new Object();
-    private static final ConcurrentHashMap<URL, Component> COMPONENT_CACHE =
+    /**
+     * Compiled component cache, keyed by {@link #cacheKeyFor(URL)} rather
+     * than the raw URL so that a rebuilt {@code file://} guest produces a
+     * distinct slot (the key folds in source mtime). Mirrors the
+     * content-blindness fix on the Rust engines
+     * (oxigraph-wf {@code d9969ed} / qlever-wf-runtime {@code 37bc02e}):
+     * URL-only keys silently returned yesterday's bytes after a
+     * {@code cargo build}, and long-running JVM hosts (Fuseki-style dev
+     * server, HTTP servlet) never noticed the guest had changed.
+     */
+    private static final ConcurrentHashMap<String, Component> COMPONENT_CACHE =
             new ConcurrentHashMap<>();
     /**
-     * Per-URL cache of the resolved entry-point name once we've seen a
-     * given component. Mirrors the component cache, but populated
-     * lazily on first successful instantiation instead of at load time
+     * Cache of the resolved entry-point name once we've seen a given
+     * component. Mirrors the component cache, but populated lazily on
+     * first successful instantiation instead of at load time
      * (webassembly4j's public {@code Component} API exposes exported
      * <em>interfaces</em>, not exported function names — the function
      * list only surfaces on the {@code ComponentInstance}).
      *
-     * <p>Keyed by URL to survive the fact that each invocation builds a
-     * fresh {@code ComponentInstance}: once the resolver has picked
-     * {@code evaluate} (or {@code search}, or a caller override) for a
-     * given URL, subsequent calls short-circuit the enumeration.
+     * <p>Keyed by the same content-aware key as {@link #COMPONENT_CACHE}
+     * so that a rebuilt guest with a different export set re-runs the
+     * resolver rather than reusing the stale pick.
      */
-    private static final ConcurrentHashMap<URL, String> AUTO_ENTRY_CACHE =
+    private static final ConcurrentHashMap<String, String> AUTO_ENTRY_CACHE =
             new ConcurrentHashMap<>();
 
     private ComponentInstance instance;
@@ -247,19 +256,55 @@ public final class Rdf4jWasmInstance implements Closeable {
     }
 
     private static Component componentFor(final URL wasmUrl) throws IOException {
-        Component cached = COMPONENT_CACHE.get(wasmUrl);
+        // Content-aware key: file:// URLs get their source mtime folded
+        // in so rebuilding a guest on disk invalidates the slot instead
+        // of silently returning stale bytes.
+        final String key = cacheKeyFor(wasmUrl);
+        Component cached = COMPONENT_CACHE.get(key);
         if (cached != null) return cached;
         final Engine engine = sharedEngine();
         try {
-            return COMPONENT_CACHE.computeIfAbsent(wasmUrl, u -> {
+            return COMPONENT_CACHE.computeIfAbsent(key, k -> {
                 try {
-                    return engine.loadComponent(readAll(u));
+                    return engine.loadComponent(readAll(wasmUrl));
                 } catch (IOException ioe) {
                     throw new UncheckedIOException(ioe);
                 }
             });
         } catch (UncheckedIOException e) {
             throw e.getCause();
+        }
+    }
+
+    /**
+     * Derive the component cache key for {@code wasmUrl}. HTTP/HTTPS/
+     * IPFS/IPNS URLs return their string form unchanged — HTTP because
+     * v0.1 doesn't honour Cache-Control/ETag anyway (every cold-cache
+     * lookup already re-fetches), IPFS/IPNS because the content address
+     * is baked into the URL itself. For {@code file://} URLs the source
+     * mtime nanos are appended so a rewrite produces a distinct key.
+     *
+     * <p>Missing / unreadable files fall through to the bare URL so the
+     * subsequent fetch surfaces the honest error (rather than us
+     * silently miscaching a stub key). Mirrors
+     * {@code oxigraph-wf/src/wf_call.rs::cache_key_for} and
+     * {@code qlever-wf-runtime}'s {@code cache_key_for_url}.
+     */
+    static String cacheKeyFor(final URL wasmUrl) {
+        final String url = wasmUrl.toString();
+        if (!"file".equalsIgnoreCase(wasmUrl.getProtocol())) {
+            return url;
+        }
+        try {
+            final java.nio.file.Path p = java.nio.file.Paths.get(wasmUrl.toURI());
+            if (!java.nio.file.Files.exists(p)) {
+                return url;
+            }
+            final java.nio.file.attribute.FileTime ft =
+                    java.nio.file.Files.getLastModifiedTime(p);
+            return url + "#mtime=" + ft.to(java.util.concurrent.TimeUnit.NANOSECONDS);
+        } catch (Exception ignored) {
+            return url;
         }
     }
 
@@ -848,10 +893,13 @@ public final class Rdf4jWasmInstance implements Closeable {
         }
         // Cache the auto-detected name per URL; the enumeration is cheap
         // but there's no reason to repeat it every wf:partial dispatch.
-        final String cached = AUTO_ENTRY_CACHE.get(wasmUrl);
+        // Same content-aware key as COMPONENT_CACHE so a rebuilt guest
+        // rebuilds its resolution.
+        final String key = cacheKeyFor(wasmUrl);
+        final String cached = AUTO_ENTRY_CACHE.get(key);
         if (cached != null) return cached;
         final String resolved = EntryPointResolver.resolve(instance.exportedFunctions(), null);
-        AUTO_ENTRY_CACHE.putIfAbsent(wasmUrl, resolved);
+        AUTO_ENTRY_CACHE.putIfAbsent(key, resolved);
         return resolved;
     }
 
