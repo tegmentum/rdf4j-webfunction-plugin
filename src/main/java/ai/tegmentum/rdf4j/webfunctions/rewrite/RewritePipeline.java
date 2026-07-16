@@ -76,6 +76,19 @@ public final class RewritePipeline {
 
     public static Builder builder() { return new Builder(); }
 
+    /**
+     * Resolve the wf_sagegraph.wasm URL from the {@code WF_SAGEGRAPH_WASM_URL}
+     * env var. Returns empty string when unset so
+     * {@link WfSageGraphRewrite} short-circuits — operators without the
+     * guest artifact see the sugar reach their SERVICE dispatcher and
+     * surface a normal unresolved-SERVICE error rather than a silent
+     * no-op fold. Mirrors {@code oxigraph-wf/src/main.rs} line 1263-1264.
+     */
+    private static String sagegraphWasmUrl() {
+        final String env = System.getenv("WF_SAGEGRAPH_WASM_URL");
+        return env == null ? "" : env;
+    }
+
     public InvokeRegistry     invokeRegistry()     { return invokeRegistry; }
     public ConversionRegistry conversionRegistry() { return conversionRegistry; }
     public AliasMap           aliasMap()           { return aliasMap; }
@@ -149,6 +162,22 @@ public final class RewritePipeline {
         // in the FederationRegistry and returns a handler that POSTs the
         // whole SERVICE clause to the remote Oxigraph endpoint. See
         // `WfServiceResolver.getService` for the wf-vector branch.
+        // WfSageGraphRewrite folds SERVICE <wf-sagegraph:<name>?…> into
+        // a SERVICE <wf-invoke:<hex>> allocation targeting the
+        // locally-registered wf_sagegraph guest at
+        // $WF_SAGEGRAPH_WASM_URL (memo wf-sagegraph.md §04 / §11).
+        // Unlike wf-vector, this dispatches the guest LOCALLY per
+        // wave-8's host-callback pattern — no outer SERVICE wrap, so
+        // the parseServiceExpression regex caveat above doesn't apply.
+        // Runs BEFORE WfFederationRewrite / WfSearchRewrite / ShapeRewrite
+        // so downstream passes see the folded shape rather than an
+        // opaque wf-sagegraph: SERVICE they would leave alone. Empty
+        // env var or absent SERVICE-body wf:embedding projection →
+        // short-circuits inside the pass.
+        final String sagegraphWasmUrl = sagegraphWasmUrl();
+        if (invokeRegistry != null && !sagegraphWasmUrl.isEmpty()) {
+            out.add(new WfSageGraphRewrite(invokeRegistry, sagegraphWasmUrl));
+        }
         // WfFederationRewrite runs after Alias (so aliased predicate IRIs
         // are canonicalised before the source-selection lookup) and
         // BEFORE WfSearchRewrite (which expands the wf-search:/wf-fetch:/
