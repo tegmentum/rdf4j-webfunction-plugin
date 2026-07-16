@@ -346,6 +346,23 @@ public final class Rdf4jWasmInstance implements Closeable {
     public List<WitValueMarshaller.Row> invokeEntry(final String entryPointOverride,
                                                     final ValueFactory vf,
                                                     final Value... args) throws IOException {
+        return invokeEntry(entryPointOverride, vf, null, args);
+    }
+
+    /**
+     * Full-fidelity variant that also threads an optional
+     * {@code inputNodeIri} decode-time context. The decoder uses this
+     * only when the guest returns a bare {@code list<float32>} — the
+     * wf_sagegraph {@code embed} shape — to bind {@code ?node}
+     * alongside the emitted {@code ?embedding} in the same row. Every
+     * other return shape ignores the hint, so wf_fulltext /
+     * wf_document / etc. are unaffected. See
+     * {@link WitValueMarshaller#bindingSetsFromWit(WitValue, ValueFactory, String)}.
+     */
+    public List<WitValueMarshaller.Row> invokeEntry(final String entryPointOverride,
+                                                    final ValueFactory vf,
+                                                    final String inputNodeIri,
+                                                    final Value... args) throws IOException {
         final String entry = resolveEntryPoint(entryPointOverride);
         // Marshal callsite args to whatever the export actually wants.
         // Legacy `evaluate(list<value>)` guests still take a single packed
@@ -356,7 +373,7 @@ public final class Rdf4jWasmInstance implements Closeable {
         // {@code marshalTypedArgs} for the coercion policy.
         final Object[] callArgs = marshalTypedArgs(entry, args);
         final WitValue result = (WitValue) instance.invokeWit(entry, callArgs);
-        return WitValueMarshaller.bindingSetsFromWit(unwrapOk(result), vf);
+        return WitValueMarshaller.bindingSetsFromWit(unwrapOk(result), vf, inputNodeIri);
     }
 
     /**

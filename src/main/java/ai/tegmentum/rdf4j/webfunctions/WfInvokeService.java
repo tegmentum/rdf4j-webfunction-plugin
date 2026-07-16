@@ -152,6 +152,15 @@ public final class WfInvokeService implements FederatedService {
         final List<Value> args = spec.args();
         final Value[] argArr = args.toArray(new Value[0]);
 
+        // Thread the first positional arg's string value as an optional
+        // decode-time context hint. Only the bare `list<float32>`
+        // return branch (wf_sagegraph `embed`) consumes it — to bind
+        // `?node` alongside the emitted `?embedding` in the same row.
+        // Every other return shape ignores the hint, so wf_fulltext /
+        // wf_document / etc. are unaffected. See
+        // WitValueMarshaller#floatListToRows.
+        final String inputNodeIri = argArr.length == 0 ? null : argArr[0].stringValue();
+
         final List<WitValueMarshaller.Row> rows;
         try (Rdf4jWasmInstance instance = new Rdf4jWasmInstance(wasmUrl)) {
             // Honor a caller-supplied entry-point override (populated by
@@ -159,7 +168,7 @@ public final class WfInvokeService implements FederatedService {
             // exports something other than `evaluate` — e.g.
             // wf_fulltext exports `search`). Null routes through
             // Rdf4jWasmInstance's auto-detect path.
-            rows = instance.invokeEntry(spec.entryPoint(), VF, argArr);
+            rows = instance.invokeEntry(spec.entryPoint(), VF, inputNodeIri, argArr);
         } catch (IOException e) {
             throw new QueryEvaluationException(
                     "wf-invoke: SERVICE failed: " + e.getMessage(), e);
