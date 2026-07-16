@@ -86,6 +86,17 @@ public final class FederationRegistry {
          * growing a Postgres backend (memo &sect;11 step 2).
          */
         WF_RELATIONAL,
+        /**
+         * Substrate {@code wf-sagegraph:} URL sugar (wf-sagegraph design
+         * memo &sect;04). RDF4J has no native sagegraph embedder in v0.1;
+         * the federation pass still emits
+         * {@code SERVICE <wf-sagegraph:<name>?node=<uri>&k=<n>>} for
+         * entries of this type, but the URL stays unfolded and will
+         * error unless a wf-sagegraph-capable backend is federated in
+         * some other way. v0.1 ships end-to-end coverage only on
+         * Oxigraph's embedded degree-features embedder (memo &sect;13).
+         */
+        WF_SAGEGRAPH,
         /** External SPARQL endpoint reached over HTTP. */
         HTTP_SPARQL
     }
@@ -330,11 +341,12 @@ public final class FederationRegistry {
             case "wf-document", "wf_document" -> SourceType.WF_DOCUMENT;
             case "wf-vector", "wf_vector" -> SourceType.WF_VECTOR;
             case "wf-relational", "wf_relational" -> SourceType.WF_RELATIONAL;
+            case "wf-sagegraph", "wf_sagegraph" -> SourceType.WF_SAGEGRAPH;
             case "http-sparql", "http_sparql" -> SourceType.HTTP_SPARQL;
             default -> throw new IllegalArgumentException(
                     "federation registry source `" + name + "`: unknown type `" + typeStr
                             + "` (expected `sparql`, `wf-search`, `wf-fetch`, `wf-document`, "
-                            + "`wf-vector`, `wf-relational`, or `http-sparql`)");
+                            + "`wf-vector`, `wf-relational`, `wf-sagegraph`, or `http-sparql`)");
         };
         if (!raw.hasNonNull("endpoint")) {
             throw new IllegalArgumentException(

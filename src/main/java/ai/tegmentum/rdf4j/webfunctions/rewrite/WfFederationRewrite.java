@@ -425,6 +425,13 @@ public final class WfFederationRewrite implements QueryOptimizer {
             // stays unfolded unless a wf-fetch dispatcher on the JVM
             // side grows Postgres support (memo §04, §11 step 2).
             case WF_RELATIONAL       -> "wf-relational:" + s.name();
+            // wf-sagegraph v0.1 — RDF4J has no native sagegraph
+            // embedder; the URL stays unfolded and dispatches against
+            // the substrate URL surface. On engines without a
+            // wf-sagegraph-capable backend registered separately this
+            // will error (wf-sagegraph memo §13 defers real ML to
+            // v0.2+).
+            case WF_SAGEGRAPH        -> "wf-sagegraph:" + s.name();
         };
     }
 
@@ -461,7 +468,7 @@ public final class WfFederationRewrite implements QueryOptimizer {
             // §09) — a KNN dispatch failure inside the embedded index
             // (or an unfolded wf-vector: URL on an engine that has no
             // handler) is a real bug the operator should see.
-            case WF_SEARCH, WF_FETCH, WF_DOCUMENT, WF_VECTOR -> false;
+            case WF_SEARCH, WF_FETCH, WF_DOCUMENT, WF_VECTOR, WF_SAGEGRAPH -> false;
         };
     }
 
