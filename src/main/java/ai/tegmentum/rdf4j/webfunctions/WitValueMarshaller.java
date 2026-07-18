@@ -38,10 +38,20 @@ import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Marshalling between RDF4J {@link Value} and the WIT value model declared in
- * {@code src/main/wit/webfunction.wit}. Package name is {@code
- * stardog:webfunction@0.2.0} — a shared cross-framework namespace so components
- * are portable across the Stardog, Jena, and RDF4J bindings.
+ * Marshalling between RDF4J {@link Value} and the WIT value model.
+ *
+ * <p>The base value model (variant/literal/binding shapes) lives in the
+ * tegmentum:webfunction package at src/main/wit/base/types.wit; the
+ * Stardog-only accuracy enum and cardinality record live in the
+ * stardog:webfunction@0.3.0 overlay at src/main/wit/overlay/planner.wit.
+ * The WitType instances below still mirror the pre-split
+ * stardog:webfunction@0.2.0 shape verbatim — value is still a 3-arm
+ * variant (iri/literal/bnode), literal fields are still label/datatype/
+ * lang, binding fields are still name/value. The overlay adopts the
+ * base's renamed fields at the WIT layer; the Java-side marshalling
+ * intentionally stays on the old shape until the shaded webassembly4j
+ * bindings are regenerated against the two-submodule layout (tracked
+ * separately — see the plugin's WIT migration follow-ups).
  */
 public final class WitValueMarshaller {
 
