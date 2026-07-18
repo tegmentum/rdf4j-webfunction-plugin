@@ -285,6 +285,18 @@ public final class Rdf4jWasmInstance implements Closeable {
         linker.addWitHostFunction(
             "wf:fulltext/host@0.1.0#http-post-json",
             HostCallbacks.httpPostJson());
+        // stardog:wf-fulltext/host@0.1.0 — post-well-known-exports rename
+        // of the crate-local host. The migrated wf_fulltext guest (which
+        // now exports tegmentum:webfunction/search@0.1.0) still imports
+        // its own crate-local http-post-json but under the renamed
+        // `stardog:wf-fulltext/host@0.1.0` package (its WIT declares
+        // `package stardog:wf-fulltext@0.1.0`). Registered under both
+        // names so pre-migration wf_fulltext builds (wf:fulltext/host)
+        // and post-migration builds (stardog:wf-fulltext/host) link
+        // cleanly — signature identical, delegate to the same impl.
+        linker.addWitHostFunction(
+            "stardog:wf-fulltext/host@0.1.0#http-post-json",
+            HostCallbacks.httpPostJson());
         // wf:document/host@1.3.0 — same shape (`http-post-json(url, body)
         // -> result<string, string>`) as wf:fulltext's, but under a
         // separately-versioned interface for the wf_document guest. The
@@ -314,6 +326,20 @@ public final class Rdf4jWasmInstance implements Closeable {
             HostCallbacks.sagegraphExecuteQuery());
         linker.addWitHostFunction(
             "wf:sagegraph/host@0.2.0#http-post-json",
+            HostCallbacks.httpPostJson());
+        // stardog:wf-sagegraph/host@0.2.0 — post-well-known-exports
+        // rename of the crate-local host. Same delegation pattern as
+        // stardog:wf-fulltext/host above: the migrated wf_sagegraph
+        // guest (which now exports tegmentum:webfunction/embed@0.1.0)
+        // still imports its crate-local execute-query + http-post-json
+        // but under the renamed `stardog:wf-sagegraph/host@0.2.0`
+        // package. Signatures unchanged; both names delegate to the
+        // same impls so pre- and post-migration builds both link.
+        linker.addWitHostFunction(
+            "stardog:wf-sagegraph/host@0.2.0#execute-query",
+            HostCallbacks.sagegraphExecuteQuery());
+        linker.addWitHostFunction(
+            "stardog:wf-sagegraph/host@0.2.0#http-post-json",
             HostCallbacks.httpPostJson());
         // wf:embed/host@0.1.0 — two imports:
         //   `embed-text(text, model) -> result<list<f32>, string>`
@@ -1223,6 +1249,33 @@ public final class Rdf4jWasmInstance implements Closeable {
         final String key = cacheKeyFor(wasmUrl);
         final String cached = AUTO_ENTRY_CACHE.get(key);
         if (cached != null) return cached;
+        // Well-known named-export interfaces — the substrate's typed
+        // dispatch surfaces per the well-known-exports memo
+        // (~/git/webfunction-wit/docs/design/well-known-exports.md).
+        // Preferred over the bare-name search / execute / dispatch
+        // heuristic in EntryPointResolver: when a guest exports the
+        // named `tegmentum:webfunction/search@0.1.0` interface
+        // (wf_fulltext is the running example post-migration), we
+        // dispatch through the interface's `search(request)` function
+        // directly rather than sniffing a bare `search` export that no
+        // longer exists post-migration. The invocation path reaches
+        // invokeWit with the fully qualified export name; record-based
+        // argument shapes (search-request / execute-request /
+        // embed-request) are handled by the existing marshalTypedArgs
+        // infrastructure (bare-arg placement into the record's single
+        // non-optional string field — `query` / `sparql` / `text`).
+        //
+        // Order mirrors EntryPointResolver.WELL_KNOWN_ENTRY_POINTS
+        // (search wins over execute wins over embed), preserving the
+        // multi-export disambiguation contract when a guest exports
+        // more than one well-known interface.
+        for (String iface : WELL_KNOWN_INTERFACES) {
+            if (instance.exportsInterface(iface)) {
+                final String qualified = iface + "#" + wellKnownInterfaceMethodName(iface);
+                AUTO_ENTRY_CACHE.putIfAbsent(key, qualified);
+                return qualified;
+            }
+        }
         // New-shape sparql-extension guests (post-migration to
         // tegmentum:webfunction@0.1.0) export only interface-qualified
         // functions — `exportedFunctions()` returns bare top-level names
@@ -1253,6 +1306,34 @@ public final class Rdf4jWasmInstance implements Closeable {
         }
         AUTO_ENTRY_CACHE.putIfAbsent(key, resolved);
         return resolved;
+    }
+
+    /**
+     * Well-known named-export interfaces, in priority order. Mirrors
+     * {@code oxigraph-wf}'s equivalent list and the sibling
+     * {@link EntryPointResolver#WELL_KNOWN_ENTRY_POINTS} bare-name
+     * heuristic. Detection uses
+     * {@link ComponentInstance#exportsInterface}; each interface's
+     * method name comes from {@link #wellKnownInterfaceMethodName}.
+     */
+    static final List<String> WELL_KNOWN_INTERFACES = List.of(
+            "tegmentum:webfunction/search@0.1.0",
+            "tegmentum:webfunction/execute@0.1.0",
+            "tegmentum:webfunction/embed@0.1.0");
+
+    /**
+     * The method name each well-known interface exposes. Kept as a
+     * static lookup rather than parsed off the interface name because
+     * the WIT's method-name convention (all three currently share the
+     * base name of the interface) is a coincidence, not a rule — a
+     * future well-known interface may expose multiple methods.
+     */
+    private static String wellKnownInterfaceMethodName(final String iface) {
+        if (iface.startsWith("tegmentum:webfunction/search@")) return "search";
+        if (iface.startsWith("tegmentum:webfunction/execute@")) return "execute";
+        if (iface.startsWith("tegmentum:webfunction/embed@")) return "embed";
+        throw new IllegalArgumentException(
+                "no method name mapping for well-known interface: " + iface);
     }
 
     /**
