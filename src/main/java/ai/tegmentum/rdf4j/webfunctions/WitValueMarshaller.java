@@ -40,23 +40,48 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Marshalling between RDF4J {@link Value} and the WIT value model.
  *
- * <p>The base value model (variant/literal/binding shapes) lives in the
- * tegmentum:webfunction package at src/main/wit/base/types.wit; the
- * Stardog-only accuracy enum and cardinality record live in the
- * stardog:webfunction@0.3.0 overlay at src/main/wit/overlay/planner.wit.
- * The WitType instances below still mirror the pre-split
- * stardog:webfunction@0.2.0 shape verbatim — value is still a 3-arm
- * variant (iri/literal/bnode), literal fields are still label/datatype/
- * lang, binding fields are still name/value. The overlay adopts the
- * base's renamed fields at the WIT layer; the Java-side marshalling
- * intentionally stays on the old shape until the shaded webassembly4j
- * bindings are regenerated against the two-submodule layout (tracked
- * separately — see the plugin's WIT migration follow-ups).
+ * <p>The value model here mirrors the tegmentum:webfunction@0.1.0 base
+ * (src/main/wit/base/types.wit) and the stardog:webfunction@0.3.0
+ * overlay (src/main/wit/overlay/planner.wit). The plugin's runtime
+ * dispatch (Rdf4jWasmInstance) still uses the flat-world exports
+ * (evaluate / aggregate-step / aggregate-finish / cardinality-estimate
+ * / doc) rather than the base's sparql-extension world, so this
+ * marshaller pairs those exports with the base's TYPE shapes:
+ *
+ * <ul>
+ *   <li>{@code term} variant (4 arms — named-node / blank-node /
+ *       literal / triple) instead of the pre-R5 {@code value} 3-arm
+ *       variant. Quoted triples cannot flow through the RDF4J planner
+ *       surface exposed by this plugin, so a returned {@code triple(...)}
+ *       arm is rejected with an IllegalArgumentException at the
+ *       boundary.</li>
+ *   <li>{@code literal.value} (was {@code label}),
+ *       {@code literal.datatype: option<iri>} (was string), and
+ *       {@code literal.language} (was {@code lang}).</li>
+ *   <li>{@code binding.variable} (was {@code name}).</li>
+ * </ul>
+ *
+ * <p>The rdf4j plugin's tests consume the component-mode wasm crates
+ * shipped by the sibling stardog-webfunction-plugin (to_upper_component
+ * / multi_var_component / sum_component); those crates were migrated
+ * to the matching type shapes in that repo, so this marshaller and
+ * those wasm artifacts land the two sides of the type contract
+ * together.
+ *
+ * <p>{@link HostCallbacks} still constructs and decodes {@code
+ * ComponentVal} bindings using the pre-split field names
+ * (name/label/lang, iri/bnode arms). Its migration onto the base
+ * {@code host-callbacks} interface is part of the full
+ * sparql-extension world migration follow-up, which is blocked at the
+ * webassembly4j level on outgoing WIT resource-method invocation
+ * (needed for the aggregate resource lifecycle).
  */
 public final class WitValueMarshaller {
 
     static final WitType LITERAL_TYPE;
-    static final WitType VALUE_TYPE;
+    static final WitType FLAT_TERM_TYPE;
+    static final WitType QUOTED_TRIPLE_TYPE;
+    static final WitType TERM_TYPE;
     static final WitType BINDING_TYPE;
     static final WitType BINDING_SETS_TYPE;
     static final WitType ACCURACY_TYPE;
@@ -64,20 +89,33 @@ public final class WitValueMarshaller {
 
     static {
         final Map<String, WitType> literalFields = new LinkedHashMap<>();
-        literalFields.put("label", WitType.createString());
-        literalFields.put("datatype", WitType.createString());
-        literalFields.put("lang", WitType.option(WitType.createString()));
+        literalFields.put("value", WitType.createString());
+        literalFields.put("datatype", WitType.option(WitType.createString()));
+        literalFields.put("language", WitType.option(WitType.createString()));
         LITERAL_TYPE = WitType.record("literal", literalFields);
 
-        final Map<String, Optional<WitType>> valueCases = new LinkedHashMap<>();
-        valueCases.put("iri", Optional.of(WitType.createString()));
-        valueCases.put("literal", Optional.of(LITERAL_TYPE));
-        valueCases.put("bnode", Optional.of(WitType.createString()));
-        VALUE_TYPE = WitType.variant("value", valueCases);
+        final Map<String, Optional<WitType>> flatTermCases = new LinkedHashMap<>();
+        flatTermCases.put("named-node", Optional.of(WitType.createString()));
+        flatTermCases.put("blank-node", Optional.of(WitType.createString()));
+        flatTermCases.put("literal", Optional.of(LITERAL_TYPE));
+        FLAT_TERM_TYPE = WitType.variant("flat-term", flatTermCases);
+
+        final Map<String, WitType> quotedTripleFields = new LinkedHashMap<>();
+        quotedTripleFields.put("subject", FLAT_TERM_TYPE);
+        quotedTripleFields.put("predicate", FLAT_TERM_TYPE);
+        quotedTripleFields.put("object", FLAT_TERM_TYPE);
+        QUOTED_TRIPLE_TYPE = WitType.record("quoted-triple", quotedTripleFields);
+
+        final Map<String, Optional<WitType>> termCases = new LinkedHashMap<>();
+        termCases.put("named-node", Optional.of(WitType.createString()));
+        termCases.put("blank-node", Optional.of(WitType.createString()));
+        termCases.put("literal", Optional.of(LITERAL_TYPE));
+        termCases.put("triple", Optional.of(QUOTED_TRIPLE_TYPE));
+        TERM_TYPE = WitType.variant("term", termCases);
 
         final Map<String, WitType> bindingFields = new LinkedHashMap<>();
-        bindingFields.put("name", WitType.createString());
-        bindingFields.put("value", VALUE_TYPE);
+        bindingFields.put("variable", WitType.createString());
+        bindingFields.put("value", TERM_TYPE);
         BINDING_TYPE = WitType.record("binding", bindingFields);
 
         final Map<String, WitType> bindingSetsFields = new LinkedHashMap<>();
@@ -101,34 +139,40 @@ public final class WitValueMarshaller {
 
     public static WitValue toWit(final Value value) {
         if (value instanceof IRI iri) {
-            return WitVariant.of(VALUE_TYPE, "iri", witString(iri.stringValue()));
+            return WitVariant.of(TERM_TYPE, "named-node", witString(iri.stringValue()));
         }
         if (value instanceof BNode bnode) {
-            return WitVariant.of(VALUE_TYPE, "bnode", witString(bnode.getID()));
+            return WitVariant.of(TERM_TYPE, "blank-node", witString(bnode.getID()));
         }
         if (value instanceof Literal literal) {
-            return WitVariant.of(VALUE_TYPE, "literal", literalToWit(literal));
+            return WitVariant.of(TERM_TYPE, "literal", literalToWit(literal));
         }
         throw new IllegalArgumentException("Unsupported Value kind: " + value.getClass().getName());
     }
 
     private static WitRecord literalToWit(final Literal literal) {
         final WitType optionStringType = WitType.option(WitType.createString());
+        // datatype is option<iri> in the base WIT: absent means xsd:string
+        // per RDF 1.1 defaulting. RDF4J's SimpleLiteral carries a concrete
+        // datatype for every literal (xsd:string for plain ones); encode
+        // that explicitly here rather than reflecting it as None so
+        // round-trips preserve the observed datatype without an implicit
+        // defaulting step across the boundary.
         final Optional<String> lang = literal.getLanguage();
         final String datatype = literal.getDatatype() != null
                 ? literal.getDatatype().stringValue()
                 : XSD.STRING.stringValue();
         return WitRecord.builder()
-                .field("label", witString(literal.getLabel()))
-                .field("datatype", witString(datatype))
-                .field("lang", lang.isPresent()
-                        ? WitOption.some(optionStringType, witString(lang.get()))
+                .field("value", witString(literal.getLabel()))
+                .field("datatype", (WitValue) WitOption.some(optionStringType, witString(datatype)))
+                .field("language", lang.isPresent()
+                        ? (WitValue) WitOption.some(optionStringType, witString(lang.get()))
                         : WitOption.none(optionStringType))
                 .build();
     }
 
     public static WitList toWitArgs(final Value[] args) {
-        if (args.length == 0) return WitList.empty(VALUE_TYPE);
+        if (args.length == 0) return WitList.empty(TERM_TYPE);
         final List<WitValue> elems = new ArrayList<>(args.length);
         for (Value v : args) elems.add(toWit(v));
         return WitList.of(elems);
@@ -147,24 +191,32 @@ public final class WitValueMarshaller {
     public static Value valueFromWit(final WitValue witValue, final ValueFactory vf) {
         final WitVariant variant = (WitVariant) witValue;
         switch (variant.getCaseName()) {
-            case "iri":
+            case "named-node":
                 return vf.createIRI(
                         ((WitString) variant.getPayload()
-                                .orElseThrow(() -> missingPayload("iri"))).getValue());
-            case "bnode":
+                                .orElseThrow(() -> missingPayload("named-node"))).getValue());
+            case "blank-node":
                 return vf.createBNode(
                         ((WitString) variant.getPayload()
-                                .orElseThrow(() -> missingPayload("bnode"))).getValue());
+                                .orElseThrow(() -> missingPayload("blank-node"))).getValue());
             case "literal":
                 return literalFromWit((WitRecord) variant.getPayload()
                         .orElseThrow(() -> missingPayload("literal")), vf);
+            case "triple":
+                // Quoted triples are first-class in the base WIT `term` but
+                // the RDF4J planner surface exposed by this plugin has no
+                // notion of them. Reject rather than lossily encode;
+                // downstream call paths should never receive a triple arm
+                // from a well-behaved extension.
+                throw new IllegalArgumentException(
+                        "term variant 'triple' (RDF-star quoted triple) is not supported at the RDF4J boundary");
             default:
-                throw new IllegalArgumentException("Unknown value case: " + variant.getCaseName());
+                throw new IllegalArgumentException("Unknown term case: " + variant.getCaseName());
         }
     }
 
     private static IllegalArgumentException missingPayload(final String kase) {
-        return new IllegalArgumentException("value variant '" + kase + "' is missing payload");
+        return new IllegalArgumentException("term variant '" + kase + "' is missing payload");
     }
 
     // Cache datatype IRIs so repeated literal round-trips don't allocate a
@@ -173,15 +225,25 @@ public final class WitValueMarshaller {
     // and profiling showed this was ~half of the evaluate-hot-path allocations.
     private static final ConcurrentHashMap<String, IRI> DATATYPE_CACHE = new ConcurrentHashMap<>();
 
+    @SuppressWarnings("unchecked")
     private static Literal literalFromWit(final WitRecord record, final ValueFactory vf) {
-        final String label = ((WitString) record.getField("label")).getValue();
-        final String datatype = ((WitString) record.getField("datatype")).getValue();
-        final Optional<Object> lang = ((WitOption) record.getField("lang")).toJava();
-        if (lang.isPresent()) {
-            return vf.createLiteral(label, (String) lang.get());
+        final String value = ((WitString) record.getField("value")).getValue();
+        final Optional<Object> datatypeOpt = ((WitOption) record.getField("datatype")).toJava();
+        final Optional<Object> languageOpt = ((WitOption) record.getField("language")).toJava();
+        // RDF 1.1 semantics: a language tag wins outright — any datatype
+        // the guest emitted alongside is ignored (a well-behaved guest
+        // would emit rdf:langString or None, but neither can override
+        // the language-tagged literal).
+        if (languageOpt.isPresent()) {
+            return vf.createLiteral(value, (String) languageOpt.get());
         }
-        final IRI dt = DATATYPE_CACHE.computeIfAbsent(datatype, vf::createIRI);
-        return vf.createLiteral(label, dt);
+        if (datatypeOpt.isPresent()) {
+            final String dtIri = (String) datatypeOpt.get();
+            final IRI dt = DATATYPE_CACHE.computeIfAbsent(dtIri, vf::createIRI);
+            return vf.createLiteral(value, dt);
+        }
+        // RDF 1.1: absent datatype + absent language ≡ xsd:string.
+        return vf.createLiteral(value, XSD.STRING);
     }
 
     /**
@@ -243,7 +305,7 @@ public final class WitValueMarshaller {
             final List<Value> byName = new ArrayList<>(java.util.Collections.nCopies(vars.size(), null));
             for (WitValue bindingVal : ((WitList) rowVal).getElements()) {
                 final WitRecord binding = (WitRecord) bindingVal;
-                final String name = ((WitString) binding.getField("name")).getValue();
+                final String name = ((WitString) binding.getField("variable")).getValue();
                 final Value value = valueFromWit(binding.getField("value"), vf);
                 final int idx = vars.indexOf(name);
                 if (idx >= 0) byName.set(idx, value);
