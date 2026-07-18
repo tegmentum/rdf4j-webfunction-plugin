@@ -237,6 +237,42 @@ public final class Rdf4jWasmInstance implements Closeable {
             linker.addWitHostFunction(
                 "stardog:webfunction/host@0.6.0#sink-close",
                 HostCallbacks.sinkClose());
+            // tegmentum:webfunction/graph-callbacks@0.1.0 — base-substrate
+            // graph callback surface for guests targeting `world
+            // extension-with-host-callbacks`. Registered alongside the
+            // legacy stardog:webfunction/host@0.3.x-0.6.0 imports so both
+            // pre-migration guests (bare stardog imports) and migrated
+            // guests (tegmentum:webfunction graph-callbacks) link cleanly
+            // from the same Rdf4jWasmInstance construction. Signatures
+            // differ from the legacy shape: execute-query takes one string
+            // (no bindings, no max-rows) and returns `result<query-result,
+            // graph-call-error>`; execute-update takes one string and
+            // returns `result<_, graph-call-error>`. MVP adapter wraps
+            // the same executor CallbackContext already exposes for the
+            // legacy path; return-value marshalling constructs the
+            // base-WIT term / query-result / graph-call-error variants
+            // directly (see HostCallbacks.graphExecuteQuery /
+            // graphExecuteUpdate for the shape details).
+            //
+            // Gated behind the same `webfunctions.callback.enabled` knob
+            // as the legacy stardog:webfunction/host family — the flag
+            // controls re-entry into the graph regardless of which WIT
+            // shape the guest speaks.
+            //
+            // http-callbacks / wasm-callbacks are deliberately NOT
+            // registered here: their shapes diverge substantially from
+            // the existing wf:fulltext/wf:document http-post-json and
+            // stardog:webfunction/host invoke-wasm impls, and no
+            // observed guest imports them yet. Adding them under
+            // mismatched signatures would trap at instantiate time for
+            // any guest that IS importing them, so we defer the wiring
+            // until a guest lands that needs them (memo: deferred).
+            linker.addWitHostFunction(
+                "tegmentum:webfunction/graph-callbacks@0.1.0#execute-query",
+                HostCallbacks.graphExecuteQuery());
+            linker.addWitHostFunction(
+                "tegmentum:webfunction/graph-callbacks@0.1.0#execute-update",
+                HostCallbacks.graphExecuteUpdate());
         }
         // wf:fulltext/host@0.1.0 — one import, `http-post-json`. The
         // wf_fulltext guest declares its own WIT world (versioned under
@@ -474,6 +510,18 @@ public final class Rdf4jWasmInstance implements Closeable {
     private List<WitValueMarshaller.Row> evaluateViaBridging(final WitList argList,
                                                              final ValueFactory vf,
                                                              final String inputNodeIri) throws IOException {
+        // Direct new-shape path when wasmtime4j-provider's bridging
+        // helper can't detect the shape via its own `hasFunction`
+        // probe. See resolveEntryPoint's Javadoc for the underlying
+        // wasmtime4j limitation. `exportsInterface` sees the interface
+        // export where `hasFunction` does not, so gate the direct path
+        // on it. `invokeWit` itself accepts qualified names, so once we
+        // know the guest is new-shape we can dispatch through
+        // `extension.call` without routing through the bridging helper.
+        if (instance.exportsInterface(
+                "tegmentum:webfunction/extension@0.1.0")) {
+            return callNewShapeExtensionDirectly(argList, vf, inputNodeIri);
+        }
         final BridgingSparqlExtensionDispatch b = bridge();
         final List<WitValue> elements = argList.getElements();
         if (elements.isEmpty()) {
@@ -500,6 +548,58 @@ public final class Rdf4jWasmInstance implements Closeable {
                             java.util.Collections.singletonList(value)));
         }
         return WitValueMarshaller.bindingSetsFromWit(ok, vf, inputNodeIri);
+    }
+
+    /**
+     * Direct-dispatch equivalent of the bridging helper's new-shape
+     * path. Sidesteps {@link BridgingSparqlExtensionDispatch#callFilter}
+     * whose capability check uses
+     * {@link ComponentInstance#hasFunction(String)}, which wasmtime4j
+     * 2.4.x's provider adapter does not recognise for interface-
+     * qualified export names (only bare top-level exports return true).
+     * The dispatch itself — {@code invokeWit(qualifiedName, args...)}
+     * — DOES work for qualified names, so we route here directly once
+     * {@code exportsInterface} confirms new-shape.
+     *
+     * <p>Shares filter-function-name discovery with the bridging path
+     * (via {@link #filterFunctionNameForNewShape()}) and the same
+     * result unwrap policy as {@code evaluateViaBridging}'s new-shape
+     * branch — one term back, wrapped as a 1-row 1-var binding-set
+     * under the substrate's conventional {@code value_0} name.
+     */
+    private List<WitValueMarshaller.Row> callNewShapeExtensionDirectly(
+            final WitList argList,
+            final ValueFactory vf,
+            final String inputNodeIri) throws IOException {
+        final String funcName = filterFunctionNameForNewShape();
+        final WitValue result = (WitValue) instance.invokeWit(
+                "tegmentum:webfunction/extension@0.1.0#call",
+                witStringUnchecked(funcName),
+                argList);
+        final WitValue ok = unwrapOk(result);
+        final Value value = WitValueMarshaller.valueFromWit(ok, vf);
+        return java.util.Collections.singletonList(
+                new WitValueMarshaller.Row(
+                        java.util.Collections.singletonList("value_0"),
+                        java.util.Collections.singletonList(value)));
+    }
+
+    /**
+     * New-shape filter-function-name discovery that doesn't route
+     * through {@link BridgingSparqlExtensionDispatch}. Same policy as
+     * that helper's own probe: enumerate {@code extension.register()}
+     * once, cache the first descriptor's name.
+     */
+    private String filterFunctionNameForNewShape() throws IOException {
+        String name = cachedFilterFunctionName;
+        if (name != null) return name;
+        synchronized (this) {
+            if (cachedFilterFunctionName != null) return cachedFilterFunctionName;
+            cachedFilterFunctionName = firstRegisteredName(
+                    "tegmentum:webfunction/extension@0.1.0#register",
+                    "extension.register returned no descriptors");
+            return cachedFilterFunctionName;
+        }
     }
 
     /**
@@ -1123,7 +1223,34 @@ public final class Rdf4jWasmInstance implements Closeable {
         final String key = cacheKeyFor(wasmUrl);
         final String cached = AUTO_ENTRY_CACHE.get(key);
         if (cached != null) return cached;
-        final String resolved = EntryPointResolver.resolve(instance.exportedFunctions(), null);
+        // New-shape sparql-extension guests (post-migration to
+        // tegmentum:webfunction@0.1.0) export only interface-qualified
+        // functions — `exportedFunctions()` returns bare top-level names
+        // only, so a pure sparql-extension guest surfaces to the
+        // EntryPointResolver as no-exports. Detect the extension
+        // interface export via `exportsInterface` and return the
+        // synthetic "evaluate" name so the downstream dispatcher enters
+        // the bridging path (see invokeEntry → evaluateViaBridging),
+        // which then routes into `extension.call(name, args)` under the
+        // sparql-extension ABI. Bare-`evaluate` guests continue to
+        // reach the same synthetic name via the resolver's step-2
+        // preference below.
+        //
+        // Detection can't rely on the bridging helper's own
+        // `hasFunction(...#call)` probe: wasmtime4j 2.4.x's hasFunction
+        // only sees bare top-level exports (returns false for interface-
+        // qualified names). The plugin-side new-shape dispatch path
+        // (callNewShapeExtensionDirectly) invokes the qualified name
+        // directly rather than routing through
+        // BridgingSparqlExtensionDispatch.callFilter, which trips over
+        // the same hasFunction limitation on the way in.
+        final String resolved;
+        if (instance.exportsInterface(
+                "tegmentum:webfunction/extension@0.1.0")) {
+            resolved = "evaluate";
+        } else {
+            resolved = EntryPointResolver.resolve(instance.exportedFunctions(), null);
+        }
         AUTO_ENTRY_CACHE.putIfAbsent(key, resolved);
         return resolved;
     }
