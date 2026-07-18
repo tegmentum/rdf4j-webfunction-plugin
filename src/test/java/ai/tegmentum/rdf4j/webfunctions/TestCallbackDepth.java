@@ -21,13 +21,13 @@ import static org.junit.Assume.assumeTrue;
  * wasm-boundary trap, the linker binding itself needs a different form.
  *
  * <p>Runs against {@code debug_callback_depth.wasm} in the sibling
- * tegmentum-webfunctions crate.
+ * webfunctions crate.
  */
 public class TestCallbackDepth {
 
     private static final String WASM = System.getProperty("wf.debug.callback.depth.wasm",
             System.getProperty("user.home")
-                    + "/git/tegmentum-webfunctions/target/wasm32-wasip1/release/debug_callback_depth.wasm");
+                    + "/git/webfunctions/target/wasm32-wasip1/release/debug_callback_depth.wasm");
 
     @Test
     public void depthIsZeroAtTopLevel() throws Exception {
