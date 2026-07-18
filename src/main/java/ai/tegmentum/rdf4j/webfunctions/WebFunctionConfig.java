@@ -112,6 +112,46 @@ public final class WebFunctionConfig {
         return eb.build();
     }
 
+    /**
+     * Build a per-instantiation {@link ai.tegmentum.webassembly4j.api.config.ComponentConfig}
+     * from the same system properties consumed by {@link #buildEngine()}. Returns
+     * {@link Optional#empty()} when no per-component knob is set — callers should
+     * fall through to the {@code instantiate(linker)} overload in that case
+     * (skipping the new API keeps behaviour bit-identical for hosts that don't
+     * set any of the ceilings below).
+     *
+     * <p>Wired currently: {@code webfunctions.memory.max.bytes} (per-component
+     * linear-memory ceiling), {@code webfunctions.fuel.limit} (per-instantiate
+     * fuel budget), {@code webfunctions.table.max.elements},
+     * {@code webfunctions.max.instances}. All are provider-honoured on wasmtime4j
+     * 46.0.1-1.4.5+; other providers silently ignore per the
+     * {@link ai.tegmentum.webassembly4j.api.Component#instantiate(ai.tegmentum.webassembly4j.api.LinkingContext,
+     * ai.tegmentum.webassembly4j.api.config.ComponentConfig)} default-method contract.
+     *
+     * <p>Complements the engine-level {@link ResourceLimits} that
+     * {@link #fromSystemProperties()} already installs: the engine cap is a
+     * store-wide ceiling; the ComponentConfig cap is per-instantiation and can
+     * be tightened without rebuilding the shared engine.
+     */
+    public static java.util.Optional<ai.tegmentum.webassembly4j.api.config.ComponentConfig>
+            componentConfig() {
+        final OptionalLong maxMemory   = getLong(PROP_MAX_MEMORY_BYTES);
+        final OptionalLong fuelLimit   = getLong(PROP_FUEL_LIMIT);
+        final OptionalLong maxTableEls = getLong(PROP_MAX_TABLE_ELEMS);
+        final OptionalLong maxInst     = getLong(PROP_MAX_INSTANCES);
+        if (maxMemory.isEmpty() && fuelLimit.isEmpty()
+                && maxTableEls.isEmpty() && maxInst.isEmpty()) {
+            return java.util.Optional.empty();
+        }
+        final ai.tegmentum.webassembly4j.api.config.ComponentConfig.Builder b =
+                ai.tegmentum.webassembly4j.api.config.ComponentConfig.builder();
+        maxMemory.ifPresent(b::maxMemoryBytes);
+        fuelLimit.ifPresent(b::fuelLimit);
+        maxTableEls.ifPresent(b::maxTableElements);
+        maxInst.ifPresent(b::maxInstances);
+        return java.util.Optional.of(b.build());
+    }
+
     private static OptionalLong getLong(final String key) {
         final String raw = System.getProperty(key);
         if (raw == null || raw.isEmpty()) return OptionalLong.empty();

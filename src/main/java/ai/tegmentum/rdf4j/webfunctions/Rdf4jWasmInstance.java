@@ -295,7 +295,18 @@ public final class Rdf4jWasmInstance implements Closeable {
         if (WebFunctionConfig.wasiNnEnabled()) {
             linker.enableWasiNn(WasiNnConfig.defaults());
         }
-        this.instance = component.instantiate(linker.build());
+        // Per-instantiation memory / fuel / table / instance ceilings, when set
+        // via system properties. Absent knobs → skip the two-arg overload so
+        // hosts that don't opt in see the same instantiate path as before.
+        // webassembly4j 2.4.x's Component#instantiate(LinkingContext, ComponentConfig)
+        // is a default-method that no-ops the config on providers that don't
+        // support it — so this is safe for the (currently only) wasmtime4j path
+        // and a signature-compatible no-op elsewhere.
+        final java.util.Optional<ai.tegmentum.webassembly4j.api.config.ComponentConfig> cc =
+                WebFunctionConfig.componentConfig();
+        this.instance = cc.isPresent()
+                ? component.instantiate(linker.build(), cc.get())
+                : component.instantiate(linker.build());
     }
 
     private static Engine sharedEngine() {
