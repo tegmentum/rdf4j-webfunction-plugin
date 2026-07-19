@@ -8,8 +8,6 @@ import org.eclipse.rdf4j.sail.memory.MemoryStore;
 import org.junit.Test;
 
 import java.io.File;
-import java.util.ArrayList;
-import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assume.assumeTrue;
@@ -24,14 +22,7 @@ import static org.junit.Assume.assumeTrue;
 public class TestWfCallTupleFunctionSparql {
 
     private static final String TO_UPPER_WASM =
-            System.getProperty("wf.toUpper.wasm",
-                    System.getProperty("user.home")
-                            + "/git/stardog-webfunction-plugin/src/test/rust/target/wasm32-wasip1/release/to_upper_component.wasm");
-
-    private static final String MULTI_VAR_WASM =
-            System.getProperty("wf.multiVar.wasm",
-                    System.getProperty("user.home")
-                            + "/git/stardog-webfunction-plugin/src/test/rust/target/wasm32-wasip1/release/multi_var_component.wasm");
+            WasmFixtures.exampleUppercaseWasm();
 
     private SailRepository repo() {
         final MemoryStore store = new MemoryStore();
@@ -63,33 +54,11 @@ public class TestWfCallTupleFunctionSparql {
         }
     }
 
-    @Test
-    public void multiRowMultiVarViaMagicProperty() {
-        final File wasm = new File(MULTI_VAR_WASM);
-        assumeTrue("multi_var_component.wasm not found at " + wasm, wasm.exists());
-
-        // multi_var_component returns vars=[label,upper,length] and two rows:
-        // ("stardog","STARDOG",7) and ("jena","JENA",4).
-        final String query =
-                "PREFIX wf: <" + WfCall.NAMESPACE + ">\n" +
-                        "SELECT ?label ?upper ?length WHERE {\n" +
-                        "  (<" + wasm.toURI() + ">) wf:call (?label ?upper ?length) .\n" +
-                        "}";
-
-        try (RepositoryConnection conn = repo().getConnection();
-             TupleQueryResult r = conn.prepareTupleQuery(query).evaluate()) {
-            final List<String> labels = new ArrayList<>();
-            final List<String> uppers = new ArrayList<>();
-            final List<String> lengths = new ArrayList<>();
-            while (r.hasNext()) {
-                final BindingSet row = r.next();
-                labels.add(row.getValue("label").stringValue());
-                uppers.add(row.getValue("upper").stringValue());
-                lengths.add(row.getValue("length").stringValue());
-            }
-            assertThat(labels).containsExactlyInAnyOrder("stardog", "jena");
-            assertThat(uppers).containsExactlyInAnyOrder("STARDOG", "JENA");
-            assertThat(lengths).containsExactlyInAnyOrder("7", "4");
-        }
-    }
+    // Multi-var multi-row magic-property test retired alongside the
+    // stardog-plugin-local multi_var_component fixture. The base
+    // sparql-extension filter interface returns a single term; the
+    // multi-row multi-var shape belongs to the property-function
+    // surface. The replacement webfunctions example-multi-var-filter
+    // preserves only the 2-arg describe filter — the 3-var 2-row
+    // shape this test asserted no longer has a replacement fixture.
 }

@@ -27,14 +27,7 @@ import static org.junit.Assume.assumeTrue;
 public class TestWfCallService {
 
     private static final String TO_UPPER_WASM =
-            System.getProperty("wf.toUpper.wasm",
-                    System.getProperty("user.home")
-                            + "/git/stardog-webfunction-plugin/src/test/rust/target/wasm32-wasip1/release/to_upper_component.wasm");
-
-    private static final String MULTI_VAR_WASM =
-            System.getProperty("wf.multiVar.wasm",
-                    System.getProperty("user.home")
-                            + "/git/stardog-webfunction-plugin/src/test/rust/target/wasm32-wasip1/release/multi_var_component.wasm");
+            WasmFixtures.exampleUppercaseWasm();
 
     private static Repository REPO;
     private static FederatedServiceResolver FALLBACK;
@@ -76,48 +69,11 @@ public class TestWfCallService {
         }
     }
 
-    /**
-     * Multi-var multi-row: verifies the WIT {@code binding-sets} shape survives
-     * SERVICE end-to-end for a component that emits three vars over two rows.
-     * This is the shape declared by the WIT world but not exercised by the
-     * single-var {@link #serviceReturnsUppercasedRow} test.
-     */
-    @Test
-    public void serviceReturnsMultipleRowsAcrossMultipleVars() {
-        final File wasm = new File(MULTI_VAR_WASM);
-        assumeTrue("multi_var_component.wasm not found at " + wasm, wasm.exists());
-
-        // RDF4J's optimizer short-circuits SERVICE clauses with empty inner
-        // patterns (there is nothing to evaluate), so the WfCallService is
-        // never consulted. Include a throwaway BIND so the SERVICE clause is
-        // non-empty and RDF4J actually invokes the federated service.
-        final String queryString =
-                "SELECT ?label ?upper ?length WHERE {\n" +
-                "  SERVICE <" + wasm.toURI() + "> {\n" +
-                "    BIND(\"\" AS ?_trigger)\n" +
-                "  }\n" +
-                "}";
-
-        try (RepositoryConnection conn = REPO.getConnection()) {
-            final TupleQuery query = conn.prepareTupleQuery(QueryLanguage.SPARQL, queryString);
-            try (TupleQueryResult rs = query.evaluate()) {
-                assertThat(rs.hasNext()).isTrue();
-                final BindingSet row1 = rs.next();
-                assertThat(row1.getValue("label").stringValue()).isEqualTo("stardog");
-                assertThat(row1.getValue("upper").stringValue()).isEqualTo("STARDOG");
-                assertThat(row1.getValue("length").stringValue()).isEqualTo("7");
-                assertThat(((org.eclipse.rdf4j.model.Literal) row1.getValue("length"))
-                        .getDatatype().stringValue())
-                        .isEqualTo("http://www.w3.org/2001/XMLSchema#integer");
-
-                assertThat(rs.hasNext()).isTrue();
-                final BindingSet row2 = rs.next();
-                assertThat(row2.getValue("label").stringValue()).isEqualTo("jena");
-                assertThat(row2.getValue("upper").stringValue()).isEqualTo("JENA");
-                assertThat(row2.getValue("length").stringValue()).isEqualTo("4");
-
-                assertThat(rs.hasNext()).isFalse();
-            }
-        }
-    }
+    // Multi-var multi-row SERVICE test retired alongside the
+    // stardog-plugin-local multi_var_component fixture. The base
+    // sparql-extension filter interface returns a single term; the
+    // multi-row multi-var shape belongs to the property-function
+    // surface. The replacement webfunctions example-multi-var-filter
+    // preserves only the 2-arg describe filter — the 3-var 2-row
+    // shape this test asserted no longer has a replacement fixture.
 }
